@@ -12,6 +12,7 @@ permissions:
 jobs:
   validate:
     runs-on: [self-hosted, musa-gpu]
+    
      
     steps:
       - name: Checkout code
