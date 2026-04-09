@@ -373,6 +373,8 @@ class MusaApplyAdagradV2Op : public MusaOpKernel {
 #define REGISTER_RESOURCE_ADAGRAD_V2(T)                        \
   REGISTER_KERNEL_BUILDER(Name("ResourceApplyAdagradV2")       \
                               .Device(DEVICE_MTGPU)            \
+                              .HostMemory("var")               \
+                              .HostMemory("accum")             \
                               .HostMemory("lr")                \
                               .HostMemory("epsilon")           \
                               .TypeConstraint<T>("T"),         \
