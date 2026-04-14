@@ -8,153 +8,72 @@
 
 ### 1.1 从用户代码到 GPU 执行的完整流程
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          用户 Python 代码                                    │
-│  import tensorflow as tf                                                    │
-│  tf.load_library("./build/libmusa_plugin.so")                              │
-│  with tf.device("/device:MUSA:0"):                                         │
-│      result = tf.nn.gelu(x)                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     1. 插件加载阶段 (Plugin Load)                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  __attribute__((constructor)) OnMusaPluginLoad()                           │
-│  ├── 初始化 Telemetry 系统                                                  │
-│  └── 静态注册: DeviceFactory、GraphOptimizer、Kernels、FusionPatterns      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     2. 设备发现阶段 (Device Discovery)                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  MusaDeviceFactory::CreateDevices()                                        │
-│  ├── musaGetDeviceCount() → 发现物理 GPU                                   │
-│  ├── musaMemGetInfo() → 获取显存信息                                       │
-│  ├── 创建 MusaDevice 实例                                                  │
-│  │   ├── 创建 3 个 Stream (compute, h2d, d2h)                             │
-│  │   ├── 创建 BFCAllocator + MusaSubAllocator                            │
-│  │   ├── 创建 GPUPinnedMemoryPool                                         │
-│  │   ├── 创建 MuDNN/MuBLAS Handle                                         │
-│  │   └── 创建 MusaEventMgr                                                │
-│  └── 注册到 TensorFlow DeviceManager                                       │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     3. 图构建阶段 (Graph Building)                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  TensorFlow 构建计算图                                                      │
-│  ├── 用户定义: tf.nn.gelu(x)                                               │
-│  └── 生成 GraphDef (节点: Mul, Erf, Add, Div, Const...)                   │
-│      数据格式: NHWC, 数据类型: FP32                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     4. 图优化阶段 (Graph Optimization)                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  MusaGraphOptimizer::Optimize()                                            │
-│  ├── Step 1: Layout Optimization (NHWC → NCHW)                            │
-│  │   └── 插入 Transpose 节点，修改 data_format 属性                        │
-│  ├── Step 2: AMP Optimization (FP32 → FP16)                               │
-│  │   └── 插入 Cast 节点，修改 T 属性                                       │
-│  └── Step 3: Fusion Optimization                                          │
-│      ├── 遍历所有注册的 FusionPattern                                      │
-│      ├── Pattern.Match() → 匹配 GELU 子图                                 │
-│      └── Pattern.Apply() → 替换为 MusaGelu 节点                           │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     5. 会话执行阶段 (Session Execution)                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  TensorFlow Executor 执行优化后的图                                         │
-│  ├── 调度节点到 MUSA 设备                                                  │
-│  ├── 内存分配: BFCAllocator::Allocate()                                    │
-│  ├── 数据传输: CopyCPUTensorToDevice()                                     │
-│  │   ├── H2D Stream 异步拷贝                                              │
-│  │   └── Event 同步 → Compute Stream                                      │
-│  └── Kernel 执行: MusaGeluOp::Compute()                                    │
-│      ├── 获取 MuDNN Handle                                                │
-│      ├── 创建 mTensor 输入/输出                                           │
-│      └── mUnary::Run(handle, output, input)                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     6. 结果回传阶段 (Result Retrieval)                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  CopyDeviceTensorToCPU()                                                   │
-│  ├── Compute Stream → Event Record                                        │
-│  ├── D2H Stream → Event Wait + MemcpyAsync                                │
-│  ├── MusaEventMgr 轮询 → 回调执行                                         │
-│  └── 返回结果到用户                                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph UserCode["用户 Python 代码"]
+        code["import tensorflow as tf<br/>tf.load_library('./build/libmusa_plugin.so')<br/>with tf.device('/device:MUSA:0'):<br/>    result = tf.nn.gelu(x)"]
+    end
+
+    subgraph PluginLoad["1. 插件加载阶段 (Plugin Load)"]
+        load["__attribute__((constructor)) OnMusaPluginLoad()<br/>├── 初始化 Telemetry 系统<br/>└── 静态注册: DeviceFactory、GraphOptimizer、Kernels、FusionPatterns"]
+    end
+
+    subgraph DeviceDiscovery["2. 设备发现阶段 (Device Discovery)"]
+        discover["MusaDeviceFactory::CreateDevices()<br/>├── musaGetDeviceCount() → 发现物理 GPU<br/>├── musaMemGetInfo() → 获取显存信息<br/>├── 创建 MusaDevice 实例<br/>│   ├── 创建 3 个 Stream<br/>│   ├── 创建 BFCAllocator + MusaSubAllocator<br/>│   ├── 创建 GPUPinnedMemoryPool<br/>│   ├── 创建 MuDNN/MuBLAS Handle<br/>│   └── 创建 MusaEventMgr<br/>└── 注册到 TensorFlow DeviceManager"]
+    end
+
+    subgraph GraphBuilding["3. 图构建阶段 (Graph Building)"]
+        build["TensorFlow 构建计算图<br/>├── 用户定义: tf.nn.gelu(x)<br/>└── 生成 GraphDef (节点: Mul, Erf, Add, Div, Const...)<br/>    数据格式: NHWC, 数据类型: FP32"]
+    end
+
+    subgraph GraphOptimization["4. 图优化阶段 (Graph Optimization)"]
+        optimize["MusaGraphOptimizer::Optimize()<br/>├── Step 1: Layout Optimization (NHWC → NCHW)<br/>│   └── 插入 Transpose 节点，修改 data_format 属性<br/>├── Step 2: AMP Optimization (FP32 → FP16)<br/>│   └── 插入 Cast 节点，修改 T 属性<br/>└── Step 3: Fusion Optimization<br/>    ├── 遍历所有注册的 FusionPattern<br/>    ├── Pattern.Match() → 匹配 GELU 子图<br/>    └── Pattern.Apply() → 替换为 MusaGelu 节点"]
+    end
+
+    subgraph SessionExecution["5. 会话执行阶段 (Session Execution)"]
+        execute["TensorFlow Executor 执行优化后的图<br/>├── 调度节点到 MUSA 设备<br/>├── 内存分配: BFCAllocator::Allocate()<br/>├── 数据传输: CopyCPUTensorToDevice()<br/>│   ├── H2D Stream 异步拷贝<br/>│   └── Event 同步 → Compute Stream<br/>└── Kernel 执行: MusaGeluOp::Compute()<br/>    ├── 获取 MuDNN Handle<br/>    ├── 创建 mTensor 输入/输出<br/>    └── mUnary::Run(handle, output, input)"]
+    end
+
+    subgraph ResultRetrieval["6. 结果回传阶段 (Result Retrieval)"]
+        result["CopyDeviceTensorToCPU()<br/>├── Compute Stream → Event Record<br/>├── D2H Stream → Event Wait + MemcpyAsync<br/>├── MusaEventMgr 轮询 → 回调执行<br/>└── 返回结果到用户"]
+    end
+
+    UserCode --> PluginLoad --> DeviceDiscovery --> GraphBuilding --> GraphOptimization --> SessionExecution --> ResultRetrieval
 ```
 
 ### 1.2 各层级职责
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    TensorFlow Core                              │
-│  提供: Session、Graph、Executor、DeviceManager                  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│              MusaDeviceFactory (device_register.cc)              │
-│  职责:                                                         │
-│  • 实现 TensorFlow DeviceFactory 接口                          │
-│  • 发现物理 MUSA GPU 设备                                      │
-│  • 创建 MusaDevice 实例并注册                                  │
-│  注册: REGISTER_LOCAL_DEVICE_FACTORY("MUSA", ..., 210)         │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                     MusaDevice (musa_device.cc)                  │
-│  职责:                                                         │
-│  • 管理三个 Stream: compute、H2D、D2H                          │
-│  • 持有内存分配器: BFCAllocator + PinnedMemoryPool             │
-│  • 持有 MuDNN/MuBLAS Handle                                    │
-│  • 提供 DeviceContext 给 TensorFlow Executor                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│    MusaGraphOptimizer (musa_graph_optimizer.cc) [Grappler]       │
-│  职责:                                                         │
-│  • Layout 优化: NHWC → NCHW                                    │
-│  • AMP 自动混合精度: FP32 → FP16/BF16                          │
-│  • Fusion 融合优化: 调用 FusionPatternManager                  │
-│  注册: REGISTER_GRAPH_OPTIMIZER_AS(MusaGraphOptimizer, ...)    │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│        FusionPatternManager (fusion_pattern_manager.cc)          │
-│  职责:                                                         │
-│  • 单例模式管理所有融合模式                                    │
-│  • 按优先级排序执行                                            │
-│  • FusionKernelRegistry 检查内核可用性                         │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│          Fusion Patterns (graph_fusion/*.cc)                    │
-│  职责:                                                         │
-│  • Match(): 在 GraphDef 中匹配可融合子图                       │
-│  • Apply(): 将子图替换为融合后的单个节点                       │
-│  • GetPriority(): 定义执行顺序                                │
-│  注册: REGISTER_FUSION_PATTERN(PatternClass)                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│            Kernels (kernels/nn/*.cc, kernels/training/*.cc)      │
-│  职责:                                                         │
-│  • 实现 OpKernel::Compute()                                    │
-│  • 调用 MuDNN 库 API 执行计算                                  │
-│  • 处理输入/输出 Tensor                                        │
-│  注册: REGISTER_KERNEL_BUILDER(Name("Op").Device("MUSA"), ...) │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph TFCore["TensorFlow Core"]
+        tf["提供: Session、Graph、Executor、DeviceManager"]
+    end
+
+    subgraph DeviceFactory["MusaDeviceFactory (device_register.cc)"]
+        factory["职责:<br/>• 实现 TensorFlow DeviceFactory 接口<br/>• 发现物理 MUSA GPU 设备<br/>• 创建 MusaDevice 实例并注册<br/>注册: REGISTER_LOCAL_DEVICE_FACTORY('MUSA', ..., 210)"]
+    end
+
+    subgraph MusaDevice["MusaDevice (musa_device.cc)"]
+        device["职责:<br/>• 管理三个 Stream: compute、H2D、D2H<br/>• 持有内存分配器: BFCAllocator + PinnedMemoryPool<br/>• 持有 MuDNN/MuBLAS Handle<br/>• 提供 DeviceContext 给 TensorFlow Executor"]
+    end
+
+    subgraph GraphOptimizer["MusaGraphOptimizer (musa_graph_optimizer.cc) [Grappler]"]
+        optimizer["职责:<br/>• Layout 优化: NHWC → NCHW<br/>• AMP 自动混合精度: FP32 → FP16/BF16<br/>• Fusion 融合优化: 调用 FusionPatternManager<br/>注册: REGISTER_GRAPH_OPTIMIZER_AS(MusaGraphOptimizer, ...)"]
+    end
+
+    subgraph PatternManager["FusionPatternManager (fusion_pattern_manager.cc)"]
+        manager["职责:<br/>• 单例模式管理所有融合模式<br/>• 按优先级排序执行<br/>• FusionKernelRegistry 检查内核可用性"]
+    end
+
+    subgraph FusionPatterns["Fusion Patterns (graph_fusion/*.cc)"]
+        patterns["职责:<br/>• Match(): 在 GraphDef 中匹配可融合子图<br/>• Apply(): 将子图替换为融合后的单个节点<br/>• GetPriority(): 定义执行顺序<br/>注册: REGISTER_FUSION_PATTERN(PatternClass)"]
+    end
+
+    subgraph Kernels["Kernels (kernels/nn/*.cc, kernels/training/*.cc)"]
+        kernels["职责:<br/>• 实现 OpKernel::Compute()<br/>• 调用 MuDNN 库 API 执行计算<br/>• 处理输入/输出 Tensor<br/>注册: REGISTER_KERNEL_BUILDER(Name('Op').Device('MUSA'), ...)"]
+    end
+
+    TFCore --> DeviceFactory --> MusaDevice --> GraphOptimizer --> PatternManager --> FusionPatterns --> Kernels
 ```
 
 ---
@@ -187,13 +106,15 @@ Status MusaGraphOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
 
 **目的**: MuDNN 对 NCHW 格式有更好的优化
 
-```
-优化前 (NHWC):
-  Input[NHWC] → Conv2D[NHWC] → MaxPool[NHWC] → Output[NHWC]
+```mermaid
+flowchart LR
+    subgraph Before["优化前 (NHWC)"]
+        B1["Input[NHWC]"] --> B2["Conv2D[NHWC]"] --> B3["MaxPool[NHWC]"] --> B4["Output[NHWC]"]
+    end
 
-优化后 (NCHW):
-  Input[NHWC] → Transpose(0,3,1,2) → Conv2D[NCHW] → MaxPool[NCHW]
-            → Transpose(0,2,3,1) → Output[NHWC]
+    subgraph After["优化后 (NCHW)"]
+        A1["Input[NHWC]"] --> A2["Transpose(0,3,1,2)"] --> A3["Conv2D[NCHW]"] --> A4["MaxPool[NCHW]"] --> A5["Transpose(0,2,3,1)"] --> A6["Output[NHWC]"]
+    end
 ```
 
 **实现逻辑**:
@@ -231,13 +152,15 @@ void OptimizeLayout(GraphDef* graph) {
 
 **目的**: 在保持精度的前提下，使用 FP16/BF16 加速计算
 
-```
-优化前 (FP32):
-  Input[FP32] → MatMul[FP32] → BiasAdd[FP32] → Relu[FP32] → Output[FP32]
+```mermaid
+flowchart LR
+    subgraph BeforeAMP["优化前 (FP32)"]
+        BA1["Input[FP32]"] --> BA2["MatMul[FP32]"] --> BA3["BiasAdd[FP32]"] --> BA4["Relu[FP32]"] --> BA5["Output[FP32]"]
+    end
 
-优化后 (FP16):
-  Input[FP32] → Cast(FP32→FP16) → MatMul[FP16] → BiasAdd[FP16]
-            → Relu[FP16] → Cast(FP16→FP32) → Output[FP32]
+    subgraph AfterAMP["优化后 (FP16)"]
+        AA1["Input[FP32]"] --> AA2["Cast(FP32→FP16)"] --> AA3["MatMul[FP16]"] --> AA4["BiasAdd[FP16]"] --> AA5["Relu[FP16]"] --> AA6["Cast(FP16→FP32)"] --> AA7["Output[FP32]"]
+    end
 ```
 
 **算子分类**:
@@ -283,16 +206,19 @@ void OptimizeAMP(GraphDef* graph) {
 
 **目的**: 将多个小算子合并为一个大算子，减少 kernel launch 开销和中间结果存储
 
-```
-优化前:
-  x ──┬── Mul(0.5) ──┬────────────────────────── Mul ── Output
-      │              │                              ↑
-      └── Div(sqrt2) ── Erf ── Add(1.0) ──────────┘
-      (5 个 kernel launch, 4 个中间 tensor)
+```mermaid
+flowchart TB
+    subgraph BeforeFusion["优化前 (5 个 kernel launch, 4 个中间 tensor)"]
+        X1["x"] --> M1["Mul(0.5)"]
+        X2["x"] --> D1["Div(sqrt2)"]
+        D1 --> E1["Erf"] --> A1["Add(1.0)"]
+        M1 --> M2["Mul"]
+        A1 --> M2 --> O1["Output"]
+    end
 
-优化后:
-  x ── MusaGelu ── Output
-      (1 个 kernel launch, 0 个中间 tensor)
+    subgraph AfterFusion["优化后 (1 个 kernel launch, 0 个中间 tensor)"]
+        XF["x"] --> MG["MusaGelu"] --> OF["Output"]
+    end
 ```
 
 **融合流程**:
@@ -348,42 +274,25 @@ Status OptimizeFusion(GraphDef* graph) {
 
 ### 3.1 内存分配架构
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      TensorFlow 分配请求                         │
-│  OpKernelContext::allocate_output()                            │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                BFCAllocator (TensorFlow 核心库)                 │
-│  来源: tensorflow/core/common_runtime/bfc_allocator.h          │
-│  职责:                                                         │
-│  • 内存池管理（预分配大块，切分小块）                          │
-│  • 碎片整理（Best-Fit 合并）                                   │
-│  • 垃圾回收（定期清理未使用内存）                              │
-│  本项目配置 (musa_device.cc:489):                              │
-│  • memory_limit = free_memory * 0.9                            │
-│  • allow_growth = false (预分配)                               │
-│  • garbage_collection = true                                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                MusaSubAllocator (本项目实现)                     │
-│  来源: musa_ext/mu/device/musa_allocator.h                     │
-│  职责:                                                         │
-│  • 实现 SubAllocator 接口                                      │
-│  • 调用 musaMalloc/musaFree                                    │
-│  • 内存染色（可选，检测 UAF）                                  │
-│  • 分配追踪（Telemetry）                                       │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      MUSA Driver                                │
-│  GPU 显存物理分配                                               │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph TFRequest["TensorFlow 分配请求"]
+        req["OpKernelContext::allocate_output()"]
+    end
+
+    subgraph BFCAlloc["BFCAllocator (TensorFlow 核心库)"]
+        bfc["来源: tensorflow/core/common_runtime/bfc_allocator.h<br/>职责:<br/>• 内存池管理（预分配大块，切分小块）<br/>• 碎片整理（Best-Fit 合并）<br/>• 垃圾回收（定期清理未使用内存）<br/>本项目配置 (musa_device.cc:489):<br/>• memory_limit = free_memory * 0.9<br/>• allow_growth = false (预分配)<br/>• garbage_collection = true"]
+    end
+
+    subgraph MusaSubAlloc["MusaSubAllocator (本项目实现)"]
+        suballoc["来源: musa_ext/mu/device/musa_allocator.h<br/>职责:<br/>• 实现 SubAllocator 接口<br/>• 调用 musaMalloc/musaFree<br/>• 内存染色（可选，检测 UAF）<br/>• 分配追踪（Telemetry）"]
+    end
+
+    subgraph MUSADriver["MUSA Driver"]
+        driver["GPU 显存物理分配"]
+    end
+
+    TFRequest --> BFCAlloc --> MusaSubAlloc --> MUSADriver
 ```
 
 ### 3.2 本项目的内存分配实现
@@ -559,46 +468,31 @@ void PollLoop() {
 
 ### 3.5 内存流动完整图
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          内存流动全景图                               │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph CPUMemory["CPU 内存"]
+        PageableIn["Pageable (用户数据)"]
+        PinnedBounce["Pinned (Bounce)"]
+        PinnedPool["PinnedPool free_list_"]
+        PinnedOut["Pinned (输出缓冲)"]
+        PageableOut["Pageable (返回用户)"]
+    end
 
-[CPU 内存]                          [GPU 显存]
-┌─────────────┐                    ┌─────────────┐
-│ Pageable    │                    │ Device      │
-│ (用户数据)  │                    │ (计算用)    │
-└──────┬──────┘                    └──────┬──────┘
-       │                                  ▲
-       │ CopyCPUTensorToDevice           │
-       ▼                                  │
-┌─────────────┐    musaMemcpyAsync    ┌───┴───────────┐
-│ Pinned      │ ───────────────────► │ GPU Memory   │
-│ (Bounce)    │    (H2D Stream)      │ (BFCAllocator)│
-└──────┬──────┘                      └───────────────┘
-       │                                    │
-       │ FreeAsync (等 GPU 完成)           │ Kernel 执行
-       ▼                                    ▼
-┌─────────────┐                      ┌─────────────┐
-│ PinnedPool  │                      │ Compute     │
-│ free_list_  │                      │ Stream      │
-└─────────────┘                      └─────────────┘
-       ▲                                    │
-       │                                    │
-       │     CopyDeviceTensorToCPU         │
-       │ ◄───────────────────────────────┘
-       │        musaMemcpyAsync (D2H Stream)
-       │
-┌──────┴──────┐
-│ Pinned      │
-│ (输出缓冲)  │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│ Pageable    │
-│ (返回用户)  │
-└─────────────┘
+    subgraph GPUMemory["GPU 显存"]
+        DeviceMem["Device (计算用)"]
+        GPUMemBFC["GPU Memory (BFCAllocator)"]
+        ComputeStream["Compute Stream"]
+    end
+
+    PageableIn -->|"CopyCPUTensorToDevice"| PinnedBounce
+    PinnedBounce -->|"musaMemcpyAsync (H2D Stream)"| GPUMemBFC
+    PinnedBounce -->|"FreeAsync (等 GPU 完成)"| PinnedPool
+    GPUMemBFC -->|"Kernel 执行"| ComputeStream
+
+    ComputeStream -->|"CopyDeviceTensorToCPU<br/>musaMemcpyAsync (D2H Stream)"| PinnedOut
+    PinnedOut -->|返回| PageableOut
+
+    PinnedPool -.->|"复用"| PinnedBounce
 ```
 
 ---
@@ -607,14 +501,14 @@ void PollLoop() {
 
 ### 4.1 三流架构
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         MusaDevice                               │
-├─────────────────────────────────────────────────────────────────┤
-│  stream_       │ 主计算流     │ Kernel 执行                     │
-│  h2d_stream_   │ Host→Device │ 异步 H2D 拷贝                    │
-│  d2h_stream_   │ Device→Host │ 异步 D2H 拷贝                    │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph MusaDeviceStreams["MusaDevice 三流架构"]
+        direction TB
+        stream["stream_ (主计算流)<br/>Kernel 执行"]
+        h2d["h2d_stream_ (Host→Device)<br/>异步 H2D 拷贝"]
+        d2h["d2h_stream_ (Device→Host)<br/>异步 D2H 拷贝"]
+    end
 ```
 
 **设计目的**: H2D/D2H 拷贝与计算并行，减少流水线停顿
@@ -643,15 +537,14 @@ void CopyCPUTensorToDevice(...) {
 
 ### 4.3 MusaEventMgr 轮询机制
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       MusaEventMgr                               │
-├─────────────────────────────────────────────────────────────────┤
-│  polling_thread_     │ 专用轮询线程（100μs 间隔）               │
-│  used_events_        │ 等待完成的 (event, callback) 列表        │
-│  free_events_        │ 已完成可复用的 event 池                  │
-│  threadpool_         │ 8 线程池执行回调                         │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph EventMgr["MusaEventMgr"]
+        polling["polling_thread_ (专用轮询线程，100μs 间隔)"]
+        used["used_events_ (等待完成的 event, callback 列表)"]
+        free["free_events_ (已完成可复用的 event 池)"]
+        threadpool["threadpool_ (8 线程池执行回调)"]
+    end
 ```
 
 **轮询循环**:
@@ -694,41 +587,23 @@ void PollLoop() {
 
 ### 5.1 融合开发完整流程
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    融合算子开发流程                               │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph FusionFlow["融合算子开发流程"]
+        direction TB
 
-步骤 1: 实现融合后的 OpKernel
-    │
-    ├── 文件: musa_ext/kernels/nn/musa_xxx_op.cc
-    ├── 继承: MusaOpKernel
-    ├── 注册: REGISTER_KERNEL_BUILDER(Name("MusaXxx").Device("MUSA"), ...)
-    └── 定义: REGISTER_OP("MusaXxx").Input(...).Output(...).Attr(...)
+        Step1["步骤 1: 实现融合后的 OpKernel<br/>├── 文件: musa_ext/kernels/nn/musa_xxx_op.cc<br/>├── 继承: MusaOpKernel<br/>├── 注册: REGISTER_KERNEL_BUILDER<br/>└── 定义: REGISTER_OP"]
 
-步骤 2: 实现融合模式匹配
-    │
-    ├── 文件: musa_ext/mu/graph_fusion/xxx_fusion.h + .cc
-    ├── 继承: FusionPattern
-    ├── 实现: Match(), Apply(), GetPriority(), IsKernelAvailable()
-    └── 分析: 目标子图的节点结构和属性约束
+        Step2["步骤 2: 实现融合模式匹配<br/>├── 文件: musa_ext/mu/graph_fusion/xxx_fusion.h + .cc<br/>├── 继承: FusionPattern<br/>├── 实现: Match(), Apply(), GetPriority()<br/>└── 分析: 目标子图结构"]
 
-步骤 3: 注册融合模式
-    │
-    └── 宏: REGISTER_FUSION_PATTERN(XxxFusion)
-            REGISTER_FUSION_KERNEL(XxxFusion, []() { return true; })
+        Step3["步骤 3: 注册融合模式<br/>└── REGISTER_FUSION_PATTERN<br/>    REGISTER_FUSION_KERNEL"]
 
-步骤 4: 编写测试
-    │
-    ├── 文件: test/fusion/xxx_fusion_test.py
-    ├── 继承: MUSATestCase
-    ├── 验证: 融合成功（GraphDef 中存在融合节点）
-    └── 验证: 数值正确（与 TF 原始实现对比）
+        Step4["步骤 4: 编写测试<br/>├── 文件: test/fusion/xxx_fusion_test.py<br/>├── 继承: MUSATestCase<br/>├── 验证: 融合成功<br/>└── 验证: 数值正确"]
 
-步骤 5: 编译测试
-    │
-    ├── ./build.sh
-    └── python -m fusion.xxx_fusion_test
+        Step5["步骤 5: 编译测试<br/>├── ./build.sh<br/>└── python -m fusion.xxx_fusion_test"]
+
+        Step1 --> Step2 --> Step3 --> Step4 --> Step5
+    end
 ```
 
 ### 5.2 GELU 融合示例
