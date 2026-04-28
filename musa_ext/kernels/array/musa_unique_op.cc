@@ -58,8 +58,9 @@ class MusaUniqueOp : public MusaOpKernel {
     op.Run(handle, t_out_val, t_out_indices, t_counts, t_in, maintainer);
 
     musaStream_t stream = GetMusaStreamByCtx(ctx);
-    musaStreamSynchronize(stream);
-    int64_t num_unique = temp_counts.flat<OutIdxT>().data()[0];
+    std::vector<int64_t> nd_info;
+    t_counts.GetNdInfo(nd_info);
+    int64_t num_unique = nd_info[0];
     Tensor* out_values = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({num_unique}), &out_values));
     musaMemcpyAsync(out_values->data(), temp_out_values.data(),
