@@ -5,7 +5,7 @@ project(musa_plugin)
 set(CMAKE_C_COMPILER gcc)
 set(CMAKE_CXX_COMPILER g++)
 
-set(CMAKE_CXX_STANDARD 14)
+# C++ standard is selected after querying TensorFlow below.
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set MUSA path
@@ -29,25 +29,72 @@ else()
 endif()
 
 # Get TensorFlow parameters
-execute_process(COMMAND python3 -c "import tensorflow as tf; print(tf.sysconfig.get_include())"
+if(NOT PYTHON_EXECUTABLE)
+    set(PYTHON_EXECUTABLE python3)
+endif()
+message(STATUS "Using Python executable: ${PYTHON_EXECUTABLE}")
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; print(tf.__version__.split('+')[0])"
+    OUTPUT_VARIABLE TF_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(TF_VERSION VERSION_LESS "2.10.0")
+    set(CMAKE_CXX_STANDARD 14)
+    set(MUSA_CXX_STANDARD_FLAG -std=c++14)
+else()
+    set(CMAKE_CXX_STANDARD 17)
+    set(MUSA_CXX_STANDARD_FLAG -std=c++17)
+endif()
+message(STATUS "Using C++ standard: C++${CMAKE_CXX_STANDARD}")
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; print(tf.sysconfig.get_include())"
     OUTPUT_VARIABLE TF_INC OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND python3 -c "import tensorflow as tf; print(' '.join(tf.sysconfig.get_compile_flags()))"
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; print(' '.join(tf.sysconfig.get_compile_flags()))"
     OUTPUT_VARIABLE TF_COMPILE_FLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND python3 -c "import tensorflow as tf; print(' '.join(tf.sysconfig.get_link_flags()))"
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; print(' '.join(tf.sysconfig.get_link_flags()))"
     OUTPUT_VARIABLE TF_LINK_FLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND python3 -c "import tensorflow as tf; import os; print(os.path.dirname(tf.__file__))"
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; print(getattr(tf.sysconfig, 'CXX11_ABI_FLAG', 0))"
+    OUTPUT_VARIABLE TF_CXX11_ABI_FLAG OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import tensorflow as tf; import os; print(os.path.dirname(tf.__file__))"
     OUTPUT_VARIABLE TF_LIB_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import sysconfig; print(sysconfig.get_path('include') or '')"
+    OUTPUT_VARIABLE PYTHON_INCLUDE OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')"
+    OUTPUT_VARIABLE PYTHON_EXTENSION_SUFFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND "${PYTHON_EXECUTABLE}" -c "import pybind11; print(pybind11.get_include())"
+    OUTPUT_VARIABLE PYBIND11_INCLUDE OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE PYBIND11_RESULT)
 
 # Validate TensorFlow is available
 if(NOT TF_INC)
     message(FATAL_ERROR "Failed to get TensorFlow include path. Please ensure TensorFlow is installed.")
 endif()
+if(NOT PYTHON_INCLUDE)
+    message(FATAL_ERROR "Failed to get Python include path.")
+endif()
+set(PYBIND11_CANDIDATE_INCLUDES
+    "${PYBIND11_INCLUDE}"
+    "${TF_INC}/external/pybind11/include"
+    "${TF_INC}/external/pybind11/_virtual_includes/pybind11"
+    "${TF_INC}/external/pybind11"
+)
+set(PYBIND11_INCLUDE "")
+foreach(candidate_include ${PYBIND11_CANDIDATE_INCLUDES})
+    if(EXISTS "${candidate_include}/pybind11/pybind11.h")
+        set(PYBIND11_INCLUDE "${candidate_include}")
+        break()
+    endif()
+endforeach()
+if(NOT EXISTS "${PYBIND11_INCLUDE}/pybind11/pybind11.h")
+    message(FATAL_ERROR "Failed to find pybind11 headers. Please install pybind11 or use a TensorFlow package that includes pybind11 headers.")
+endif()
 
-# Clean ABI conflicts in TF_COMPILE_FLAGS
+# Match the C++ std::string ABI used by the TensorFlow wheel.
 string(REPLACE "-D_GLIBCXX_USE_CXX11_ABI=0" "" TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS}")
 string(REPLACE "-D_GLIBCXX_USE_CXX11_ABI=1" "" TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS}")
-# Re-add the safest definition
-set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+if(TF_CXX11_ABI_FLAG STREQUAL "1")
+    set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+else()
+    set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+endif()
 
 # Configure debug/logging-related compile definitions.
 #
@@ -59,7 +106,7 @@ set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
 # refcount aborts during session/resource destruction.
 #
 # Keep NDEBUG enabled in every build to match the TensorFlow wheel.
-set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -DMUSA_DISABLE_DEBUG_LOGGING -DNDEBUG -DMUSA_DISABLE_TRACE_LOGGING -DMUSA_DISABLE_AUTO_TRACE")
+set(TF_COMPILE_FLAGS "${TF_COMPILE_FLAGS} -DMUSA_DISABLE_DEBUG_LOGGING -DNDEBUG -DMUSA_DISABLE_AUTO_TRACE -include ${CMAKE_CURRENT_SOURCE_DIR}/musa_ext/tf_status_compat.h")
 
 # Include paths
 include_directories("${TF_INC}" "${MUSA_PATH}/include")
@@ -85,16 +132,28 @@ endif()
 
 # Define source root directory
 set(SRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/musa_ext")
+set(GRAPH_ROOT "${SRC_ROOT}/graph")
+set(GRAPH_FUSION_ROOT "${GRAPH_ROOT}/fusion")
 set(KERNELS_ROOT "${SRC_ROOT}/kernels")
 set(FUSION_ROOT "${KERNELS_ROOT}/fusion")
-include_directories("${SRC_ROOT}" "${SRC_ROOT}/mu" "${KERNELS_ROOT}" "${FUSION_ROOT}")
+include_directories(
+    "${SRC_ROOT}"
+    "${SRC_ROOT}/mu"
+    "${GRAPH_ROOT}"
+    "${GRAPH_FUSION_ROOT}"
+    "${KERNELS_ROOT}"
+    "${FUSION_ROOT}"
+)
 
 # Validate source directory exists
 if(NOT EXISTS "${SRC_ROOT}")
     message(FATAL_ERROR "Source directory '${SRC_ROOT}' does not exist.")
 endif()
+if(NOT EXISTS "${GRAPH_FUSION_ROOT}")
+    message(FATAL_ERROR "Graph fusion rule directory '${GRAPH_FUSION_ROOT}' does not exist.")
+endif()
 if(NOT EXISTS "${FUSION_ROOT}")
-    message(FATAL_ERROR "Fusion source directory '${FUSION_ROOT}' does not exist.")
+    message(FATAL_ERROR "Kernel fusion implementation directory '${FUSION_ROOT}' does not exist.")
 endif()
 
 # Link paths
@@ -104,7 +163,9 @@ link_directories("${MUSA_PATH}/lib" "${MUSA_PATH}/lib64" "${TF_LIB_DIR}")
 file(GLOB_RECURSE CPP_SOURCES
     "${SRC_ROOT}/*.cc"
     "${SRC_ROOT}/mu/*.cc"
-    "${KERNELS_ROOT}/*.cc"
+    "${SRC_ROOT}/mu/tf_compat/*.cc"
+    "${SRC_ROOT}/mu/collective/*.cc"
+    "${SRC_ROOT}/kernels/*.cc"
 )
 
 # filter out disabled kernels (if any)
@@ -112,12 +173,12 @@ file(GLOB_RECURSE CPP_SOURCES
 # Automatically collect MUSA Kernel files
 file(GLOB_RECURSE MU_SOURCES "${KERNELS_ROOT}/*.mu")
 
-# TensorFlow headers pulled into `.mu` compilation require C++17, and mcc's
-# aarch64 host predefines can incorrectly trigger NEON-only host headers.
+# TensorFlow 2.15+ headers pulled into `.mu` compilation require C++17, while
+# TensorFlow 2.6.1 must stay on C++14 to match its Abseil string_view ABI.
 set(MCC_COMMON_FLAGS
     -O3
     -fPIC
-    -std=c++17
+    ${MUSA_CXX_STANDARD_FLAG}
     -DEIGEN_DONT_VECTORIZE
     -U__ARM_NEON
     -U__ARM_NEON__
@@ -161,6 +222,27 @@ set_target_properties(musa_plugin PROPERTIES
 
 # Link
 target_link_libraries(musa_plugin PRIVATE ${TF_LINK_FLAGS} musa mublas ${MUSA_DNN_LIBRARY} rt)
+
+# Generate Python runtime configuration bindings.
+add_library(_runtime_config_bindings MODULE
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/_runtime_config_bindings.cc"
+)
+add_dependencies(_runtime_config_bindings musa_plugin)
+target_include_directories(_runtime_config_bindings PRIVATE
+    "${PYTHON_INCLUDE}"
+    "${PYBIND11_INCLUDE}"
+    "${SRC_ROOT}"
+)
+set_target_properties(_runtime_config_bindings PROPERTIES
+    PREFIX ""
+    SUFFIX "${PYTHON_EXTENSION_SUFFIX}"
+    COMPILE_FLAGS "${TF_COMPILE_FLAGS}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    SKIP_BUILD_RPATH FALSE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN;${TF_LIB_DIR};${MUSA_PATH}/lib;${MUSA_PATH}/lib64"
+)
+target_link_libraries(_runtime_config_bindings PRIVATE musa_plugin)
 
 # Output configuration
 set_target_properties(musa_plugin PROPERTIES

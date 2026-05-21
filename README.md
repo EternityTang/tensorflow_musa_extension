@@ -1,23 +1,26 @@
 # TensorFlow MUSA Extension
 
-面向摩尔线程（Moore Threads）MUSA GPU 的 TensorFlow 插件：通过 MUSA 内核与图优化为 TensorFlow 提供 GPU 加速。
+TensorFlow MUSA Extension 是面向摩尔线程（Moore Threads）MUSA GPU 的 TensorFlow 插件。它将 MUSA 设备注册、算子内核和图优化能力打包为 `tensorflow_musa` Python 包。
 
-## 特性
+## 主要特性
 
-- 核心算子与常用融合路径的 MUSA 实现
-- Grappler 图优化（布局、融合、可选混合精度等）
-- Python 包 `tensorflow_musa`：自动加载插件与设备查询
-- 可选遥测与调试说明见 [调试指南](docs/DEBUG_GUIDE.md)
+- 将 MUSA 注册为 TensorFlow 设备。
+- 提供 TensorFlow 常用算子和部分融合路径的 MUSA 实现。
+- 通过 `import tensorflow_musa` 自动加载运行时插件。
+- 调试和环境变量说明见 [docs/DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)。
 
 ## 环境要求
 
-- CMake ≥ 3.10，Make，GCC/G++（与 TensorFlow 2.6.1 wheel ABI 一致）
-- MUSA SDK（默认路径 `/usr/local/musa`）：Runtime、muBLAS、muDNN
-- Python ≥ 3.7
-- **TensorFlow == 2.6.1**（须与此版本一致）
-- NumPy ≥ 1.19.0
+- Moore Threads MUSA SDK，默认安装路径为 `/usr/local/musa`。
+- CMake 3.10 或更新版本。
+- 与目标 TensorFlow wheel ABI 兼容的 GCC/G++。
+- Python 3.7 或更新版本。
+- 构建前需先安装 TensorFlow。
+- NumPy 1.19.0 或更新版本。
 
-## 安装（推荐：Wheel）
+生成的 wheel 需要与构建时使用的 TensorFlow 版本和 Python 环境匹配。不同 TensorFlow 环境请分别构建 wheel。
+
+## 构建与安装
 
 ```bash
 git clone <repository-url>
@@ -25,88 +28,62 @@ cd tensorflow_musa_extension
 
 pip install tensorflow==2.6.1
 ./build.sh wheel
-pip install dist/tensorflow_musa-*.whl --no-deps
+pip install --force-reinstall dist/tensorflow_musa-*.whl --no-deps
 ```
 
-重新构建后覆盖安装可加 `--force-reinstall`。
+开发时如只需构建插件动态库：
+
+```bash
+./build.sh
+```
+
+推荐通过 wheel 安装后验证，这与用户实际加载包的方式一致。
 
 ## 快速验证
 
 ```python
+import tensorflow as tf
 import tensorflow_musa as tf_musa
 
-print(tf_musa.__version__)
-print(tf_musa.get_musa_devices())
+print(tf.__version__)
+print(tf.config.list_physical_devices("MUSA"))
 ```
 
-在计算图中使用 MUSA 设备（示例）：
+在 MUSA 设备上运行一个简单算子：
 
 ```python
 import tensorflow as tf
-import tensorflow_musa  # 确保插件已加载
+import tensorflow_musa
 
 with tf.device("/device:MUSA:0"):
-    a = tf.constant([[1.0, 2.0], [3.0, 4.0]])
-    b = tf.matmul(a, a)
+    x = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+    y = tf.matmul(x, x)
+
+print(y)
 ```
 
-### MUSA 自定义图优化器开关
+## 测试
 
-`tensorflow_musa` 提供了 `ConfigProto` 级别的接口，用于启用、关闭或查询 `musa_graph_optimizer`。常规推理场景推荐使用 `enable_musa_graph_optimizer(config)`，它等价于向 `config.graph_options.rewrite_options.custom_optimizers` 注册 `musa_graph_optimizer`。
-
-```python
-import tensorflow as tf
-import tensorflow_musa as tf_musa
-
-config = tf.compat.v1.ConfigProto()
-
-# 启用 MUSA 自定义图优化器
-tf_musa.enable_musa_graph_optimizer(config)
-
-# 查询是否已启用
-print(tf_musa.is_musa_graph_optimizer_enabled(config))
-
-# 关闭 MUSA 自定义图优化器
-tf_musa.disable_musa_graph_optimizer(config)
-```
-
-也可以使用统一接口显式传入开关值：
-
-```python
-tf_musa.set_musa_graph_optimizer_enabled(config, enabled=True)
-tf_musa.set_musa_graph_optimizer_enabled(config, enabled=False)
-```
-
-少数测试或调试场景需要强制设置 Grappler optimizer 列表时，可以额外传入 `add_to_optimizer_list=True`：
-
-```python
-tf_musa.enable_musa_graph_optimizer(config, add_to_optimizer_list=True)
-```
-
-## 从源码构建插件（可选）
-
-仅生成 `build/libmusa_plugin.so`（不打包 wheel）：
+从已安装的 wheel 运行算子测试：
 
 ```bash
-pip install tensorflow==2.6.1
-./build.sh          # 或 ./build.sh release
+MUSA_VISIBLE_DEVICES=5 python test/test_runner.py
 ```
 
-开发时也可在 Python 中 `tf.load_library("./build/libmusa_plugin.so")` 手动加载。
+运行单个算子测试：
 
-## 文档与示例
+```bash
+MUSA_VISIBLE_DEVICES=5 python test/test_runner.py --single matmul_op_test.py --detail
+```
 
-- [调试与环境变量](docs/DEBUG_GUIDE.md)
-- 更多示例：[TensorFlow MUSA Playground](https://gitee.com/mthreadsacademy/tensorflow_musa_playground)
+## 调试
+
+日志、GraphDef dump、遥测和运行时调试环境变量请参考 [docs/DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)。
 
 ## 参与贡献
 
-欢迎提交 Issue 与 Pull Request（新算子请附带测试）。
+欢迎提交 Issue 和 Pull Request。新增算子或行为变更请附带测试。
 
 ## 许可证
 
 Apache License 2.0
-
-## 支持
-
-请在仓库 Issue 中反馈问题或联系维护者。

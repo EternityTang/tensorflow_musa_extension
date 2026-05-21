@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -8,6 +9,7 @@
 #include "absl/strings/str_split.h"
 #include "device/musa_device.h"
 #include "musa_reduce_functor.h"
+#include "tensorflow/core/framework/bfloat16.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
@@ -15,11 +17,15 @@
 #include "tensorflow/core/lib/math/math_util.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
+#include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/matmul_bcast.h"
 #include "utils/musa_einsum_op_util.h"
 
 namespace tensorflow {
 namespace musa {
+
+extern "C" void LaunchFloatToBFloat16Copy(const float* src, void* dst,
+                                           int64_t n, musaStream_t stream);
 
 using ShapeVec = gtl::InlinedVector<int64_t, 8>;
 using Labels = gtl::InlinedVector<int, 8>;
@@ -59,7 +65,7 @@ struct EinsumHelper {
           " but got dimension ", input_dim);
     }
     (*label_to_dim_sizes)[label] = input_dim;
-    return Status::OK();
+    return OkStatus();
   }
 
   // Validate input dimensions and populate unnamed labels and their label
@@ -129,7 +135,7 @@ struct EinsumHelper {
     }
     if (!absl::c_linear_search(input_has_ellipsis, true) &&
         !output_has_ellipsis) {
-      return Status::OK();
+      return OkStatus();
     }
     // Insert broadcasting dimensions in the output labels.
     auto it =
@@ -147,7 +153,7 @@ struct EinsumHelper {
     // Populate EinsumDimensionType for the new broadcasting labels.
     label_types->resize(num_named_labels + max_bcast_dims,
                         EinsumDimensionType::kBroadcasting);
-    return Status::OK();
+    return OkStatus();
   }
 
   // Permutes the labels according to the given permutation.
@@ -163,7 +169,7 @@ struct EinsumHelper {
   // Returns a reshaped input Tensor. The underlying buffer is not copied.
   static Status CopyFrom(const Tensor& input, const TensorShape& shape,
                          Tensor* output) {
-    if (output->CopyFrom(input, shape)) return Status::OK();
+    if (output->CopyFrom(input, shape)) return OkStatus();
     return errors::Internal(
         "Encountered error while reshaping a Tensor of shape ",
         input.shape().DebugString(), " to shape ", shape.DebugString());
@@ -187,7 +193,7 @@ struct EinsumHelper {
     }
 
     TF_RETURN_IF_ERROR(ctx->allocate_temp(dst_dtype, input.shape(), output));
-    if (input.NumElements() == 0) return Status::OK();
+    if (input.NumElements() == 0) return OkStatus();
 
     auto input_mt = CreateMTensor(input);
     auto output_mt = CreateMTensor(*output);
@@ -270,7 +276,7 @@ struct EinsumHelper {
         ctx->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
 
     const int rank = reshape.size();
-    if (rank == 0) return Status::OK();
+    if (rank == 0) return OkStatus();
 
     auto compute_dense_strides = [](const ShapeVec& dims) {
       ShapeVec dense_strides(dims.size(), 1);
@@ -299,6 +305,9 @@ struct EinsumHelper {
     std::vector<int64_t> diagonal_strides_vec(diagonal_strides.begin(),
                                               diagonal_strides.end());
 
+    if (QueryMusaKernelRuntimeView(ctx).mudnn_handle == nullptr) {
+      return MusaMudnnHandleRequiredError();
+    }
     auto& handle = GetHandleByCtx(ctx);
     auto input_mt = CreateMTensor(input);
     auto output_mt = CreateMTensor(*output);
@@ -323,7 +332,7 @@ struct EinsumHelper {
       return errors::Internal("Einsum StrideOrInflate Run failed. Status: ",
                               static_cast<int>(status));
     }
-    return Status::OK();
+    return OkStatus();
   }
 
   // Returns true if the input dimensions are already sorted in the order
@@ -364,15 +373,20 @@ struct EinsumHelper {
     int64 n = trans_b ? d2 : d3;
     int64 k_check = trans_b ? d3 : d2;
 
-    if (output->NumElements() == 0) return Status::OK();
+    if (output->NumElements() == 0) return OkStatus();
 
+    if (QueryMusaKernelRuntimeView(ctx).mudnn_handle == nullptr) {
+      return MusaMudnnHandleRequiredError();
+    }
+    static bool tf32_enabled_global = []() {
+      const char* tf32_env = std::getenv("MUSA_ENABLE_TF32");
+      if (tf32_env) {
+        return std::atoi(tf32_env) != 0;
+      }
+      return true;
+    }();
     auto& handle = GetHandleByCtx(ctx);
-    handle.SetAllowTF32(false);
-    // Use TF32 setting if needed, but here we can just default or use env like
-    // matmul op. Since this is a static method, we don't have access to member
-    // tf32_enabled_. Let's check environment variable again or just assume
-    // default precision. For now, let's keep it simple and consistent with
-    // standard usage.
+    handle.SetAllowTF32(tf32_enabled_global);
 
     mTensor mt_a = CreateMTensor(in0);
     mTensor mt_b = CreateMTensor(in1);
@@ -403,7 +417,36 @@ struct EinsumHelper {
                               (int)status);
     }
 
-    return Status::OK();
+    return OkStatus();
+  }
+
+  template <typename T>
+  static Status AllocateBMatMulOutput(OpKernelContext* ctx, const Tensor& lhs,
+                                      const Tensor& rhs, bool trans_a,
+                                      bool trans_b, Tensor* output) {
+    const int rank = lhs.dims();
+    if (rank != rhs.dims() || rank < 2) {
+      return errors::InvalidArgument("BatchMatMul expects matching rank >= 2");
+    }
+    TensorShape shape;
+    for (int i = 0; i < rank - 2; ++i) {
+      if (lhs.dim_size(i) != rhs.dim_size(i)) {
+        return errors::InvalidArgument(
+            "BatchMatMul fast path expects matching batch dimensions");
+      }
+      TF_RETURN_IF_ERROR(shape.AddDimWithStatus(lhs.dim_size(i)));
+    }
+    const int64_t m = trans_a ? lhs.dim_size(rank - 1) : lhs.dim_size(rank - 2);
+    const int64_t k = trans_a ? lhs.dim_size(rank - 2) : lhs.dim_size(rank - 1);
+    const int64_t n = trans_b ? rhs.dim_size(rank - 2) : rhs.dim_size(rank - 1);
+    const int64_t k_check =
+        trans_b ? rhs.dim_size(rank - 1) : rhs.dim_size(rank - 2);
+    if (k != k_check) {
+      return errors::InvalidArgument("BatchMatMul fast path contract mismatch");
+    }
+    TF_RETURN_IF_ERROR(shape.AddDimWithStatus(m));
+    TF_RETURN_IF_ERROR(shape.AddDimWithStatus(n));
+    return ctx->allocate_temp(DataTypeToEnum<T>::value, shape, output);
   }
 
   template <typename T>
@@ -547,7 +590,7 @@ struct EinsumHelper {
 
     TF_RETURN_IF_ERROR(
         ctx->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
-    if (output->NumElements() == 0) return Status::OK();
+    if (output->NumElements() == 0) return OkStatus();
 
     std::vector<int64_t> input_dense_strides(input_rank, 1);
     for (int axis = input_rank - 2; axis >= 0; --axis) {
@@ -595,6 +638,9 @@ struct EinsumHelper {
           static_cast<int>(status));
     }
 
+    if (QueryMusaKernelRuntimeView(ctx).mudnn_handle == nullptr) {
+      return MusaMudnnHandleRequiredError();
+    }
     auto& handle = GetHandleByCtx(ctx);
     ::musa::dnn::Unary op;
     status = op.SetMode(::musa::dnn::Unary::Mode::IDENTITY);
@@ -609,7 +655,7 @@ struct EinsumHelper {
           "Einsum batch broadcast: Unary Run failed. Status: ",
           static_cast<int>(status));
     }
-    return Status::OK();
+    return OkStatus();
   }
 
   // Contracts the inputs along the last axis (or the second last if the
@@ -659,7 +705,7 @@ struct EinsumHelper {
     if (lhs.NumElements() == 0 || rhs.NumElements() == 0) {
       mTensor output_mt = CreateMTensor(*output);
       TF_RETURN_IF_ERROR(SetZeroFunctor::Compute<T>(ctx, &output_mt));
-      return Status::OK();
+      return OkStatus();
     }
     Tensor output_reshaped;
     TF_RETURN_IF_ERROR(
@@ -681,6 +727,12 @@ class MusaEinsumOp : public MusaOpKernel {
   }
 
   void Compute(OpKernelContext* ctx) override {
+    bool fast_path_done = false;
+    OP_REQUIRES_OK(ctx, TryComputeOneTrans3DEinsum(ctx, &fast_path_done));
+    if (fast_path_done) {
+      return;
+    }
+
     OpInputList inputs;
     OP_REQUIRES_OK(ctx, ctx->input_list("inputs", &inputs));
 
@@ -795,6 +847,7 @@ class MusaEinsumOp : public MusaOpKernel {
     ctx->set_output(0, output);
   }
 
+#if TF_MAJOR_VERSION < 2 || (TF_MAJOR_VERSION == 2 && TF_MINOR_VERSION < 10)
   string TraceString(const OpKernelContext& ctx, bool verbose) const override {
     string op = profiler::TraceMeOp(name_view(), type_string_view());
     string equation = strings::StrCat("(", equation_, ")");
@@ -807,11 +860,138 @@ class MusaEinsumOp : public MusaOpKernel {
     }
     return profiler::TraceMeEncode(std::move(op), {{"equation", equation}});
   }
+#endif
 
   // einsum contains bmm
   bool IsExpensive() override { return true; }
 
  private:
+  Status TryComputeOneTrans3DEinsum(OpKernelContext* ctx, bool* done) {
+    *done = false;
+    if (std::getenv("MUSA_DISABLE_ONETRANS_3D_EINSUM_FASTPATH") != nullptr) {
+      return ::tensorflow::OkStatus();
+    }
+    if (ctx->num_inputs() != 2) {
+      return ::tensorflow::OkStatus();
+    }
+
+    const Tensor& raw_a = ctx->input(0);
+    const Tensor& raw_b = ctx->input(1);
+    if (raw_a.dims() != 3 || raw_b.dims() != 3) {
+      return ::tensorflow::OkStatus();
+    }
+
+    const DataType target_dtype = DataTypeToEnum<T>::value;
+    if (target_dtype != DT_FLOAT && target_dtype != DT_DOUBLE &&
+        target_dtype != DT_HALF && target_dtype != DT_BFLOAT16) {
+      return ::tensorflow::OkStatus();
+    }
+
+    Tensor a_tmp;
+    Tensor b_tmp;
+    const Tensor* a_ptr = &raw_a;
+    const Tensor* b_ptr = &raw_b;
+    if (target_dtype == DT_BFLOAT16 && raw_a.dtype() == DT_FLOAT) {
+      TF_RETURN_IF_ERROR(ctx->allocate_temp(DT_BFLOAT16, raw_a.shape(), &a_tmp));
+      LaunchFloatToBFloat16Copy(
+          raw_a.flat<float>().data(),
+          reinterpret_cast<void*>(a_tmp.flat<bfloat16>().data()),
+          static_cast<int64_t>(raw_a.NumElements()), GetMusaStreamByCtx(ctx));
+      a_ptr = &a_tmp;
+    } else if (raw_a.dtype() != target_dtype) {
+      return ::tensorflow::OkStatus();
+    }
+    if (target_dtype == DT_BFLOAT16 && raw_b.dtype() == DT_FLOAT) {
+      TF_RETURN_IF_ERROR(ctx->allocate_temp(DT_BFLOAT16, raw_b.shape(), &b_tmp));
+      LaunchFloatToBFloat16Copy(
+          raw_b.flat<float>().data(),
+          reinterpret_cast<void*>(b_tmp.flat<bfloat16>().data()),
+          static_cast<int64_t>(raw_b.NumElements()), GetMusaStreamByCtx(ctx));
+      b_ptr = &b_tmp;
+    } else if (raw_b.dtype() != target_dtype) {
+      return ::tensorflow::OkStatus();
+    }
+
+    const Tensor& a = *a_ptr;
+    const Tensor& b = *b_ptr;
+    if (equation_ == "btd,tde->bte") {
+      const int64_t batch = a.dim_size(0);
+      const int64_t tokens = a.dim_size(1);
+      const int64_t depth = a.dim_size(2);
+      if (b.dim_size(0) != tokens || b.dim_size(1) != depth) {
+        return errors::InvalidArgument("Invalid btd,tde->bte input shapes: ",
+                                       a.shape().DebugString(), " vs ",
+                                       b.shape().DebugString());
+      }
+      Tensor lhs;
+      TF_RETURN_IF_ERROR(
+          EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &lhs));
+      Tensor contracted;
+      TF_RETURN_IF_ERROR(EinsumHelper::AllocateBMatMulOutput<T>(
+          ctx, lhs, b, /*trans_a=*/false, /*trans_b=*/false, &contracted));
+      TF_RETURN_IF_ERROR(EinsumHelper::BMatMul<T>(
+          ctx, lhs, b, /*trans_a=*/false, /*trans_b=*/false, &contracted));
+      Tensor output;
+      TF_RETURN_IF_ERROR(EinsumHelper::TransposeOperand<T>(
+          ctx, contracted, {1, 0, 2}, &output));
+      ctx->set_output(0, output);
+      *done = true;
+      return ::tensorflow::OkStatus();
+    }
+
+    if (equation_ == "bte,tde->btd") {
+      const int64_t batch = a.dim_size(0);
+      const int64_t tokens = a.dim_size(1);
+      const int64_t embed = a.dim_size(2);
+      if (b.dim_size(0) != tokens || b.dim_size(2) != embed) {
+        return errors::InvalidArgument("Invalid bte,tde->btd input shapes: ",
+                                       a.shape().DebugString(), " vs ",
+                                       b.shape().DebugString());
+      }
+      Tensor lhs;
+      TF_RETURN_IF_ERROR(
+          EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &lhs));
+      Tensor contracted;
+      TF_RETURN_IF_ERROR(EinsumHelper::AllocateBMatMulOutput<T>(
+          ctx, lhs, b, /*trans_a=*/false, /*trans_b=*/true, &contracted));
+      TF_RETURN_IF_ERROR(EinsumHelper::BMatMul<T>(
+          ctx, lhs, b, /*trans_a=*/false, /*trans_b=*/true, &contracted));
+      Tensor output;
+      TF_RETURN_IF_ERROR(EinsumHelper::TransposeOperand<T>(
+          ctx, contracted, {1, 0, 2}, &output));
+      ctx->set_output(0, output);
+      *done = true;
+      return ::tensorflow::OkStatus();
+    }
+
+    if (equation_ == "bte,btd->tde") {
+      const int64_t batch = a.dim_size(0);
+      const int64_t tokens = a.dim_size(1);
+      const int64_t embed = a.dim_size(2);
+      if (b.dim_size(0) != batch || b.dim_size(1) != tokens) {
+        return errors::InvalidArgument("Invalid bte,btd->tde input shapes: ",
+                                       a.shape().DebugString(), " vs ",
+                                       b.shape().DebugString());
+      }
+      Tensor lhs;
+      TF_RETURN_IF_ERROR(
+          EinsumHelper::TransposeOperand<T>(ctx, b, {1, 2, 0}, &lhs));
+      Tensor rhs;
+      TF_RETURN_IF_ERROR(
+          EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &rhs));
+      Tensor output;
+      TF_RETURN_IF_ERROR(EinsumHelper::AllocateBMatMulOutput<T>(
+          ctx, lhs, rhs, /*trans_a=*/false, /*trans_b=*/false, &output));
+      TF_RETURN_IF_ERROR(EinsumHelper::BMatMul<T>(
+          ctx, lhs, rhs, /*trans_a=*/false, /*trans_b=*/false, &output));
+      ctx->set_output(0, output);
+      *done = true;
+      return ::tensorflow::OkStatus();
+    }
+
+    return ::tensorflow::OkStatus();
+  }
+
   string equation_;
   OperandLabels input_labels_;
   Labels output_labels_;
@@ -821,6 +1001,97 @@ class MusaEinsumOp : public MusaOpKernel {
   gtl::InlinedVector<bool, 2> input_has_ellipsis_;
   bool output_has_ellipsis_ = false;
 };  // class MusaEinsumOp
+
+REGISTER_OP("MusaOneTrans3DEinsum")
+    .Input("a: T")
+    .Input("b: T")
+    .Output("output: T")
+    .Attr("T: {float, double, half, bfloat16}")
+    .Attr("equation: string");
+
+template <typename T>
+class MusaOneTrans3DEinsumOp : public MusaOpKernel {
+ public:
+  explicit MusaOneTrans3DEinsumOp(OpKernelConstruction* ctx)
+      : MusaOpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("equation", &equation_));
+  }
+
+  bool IsExpensive() override { return true; }
+
+  void Compute(OpKernelContext* ctx) override {
+    const Tensor& a = ctx->input(0);
+    const Tensor& b = ctx->input(1);
+    OP_REQUIRES(ctx, a.dims() == 3 && b.dims() == 3,
+                errors::InvalidArgument(
+                    "MusaOneTrans3DEinsum expects rank-3 inputs"));
+
+    if (equation_ == "btd,tde->bte") {
+      OP_REQUIRES(ctx, b.dim_size(0) == a.dim_size(1) &&
+                           b.dim_size(1) == a.dim_size(2),
+                  errors::InvalidArgument("Invalid btd,tde->bte shapes"));
+      Tensor lhs;
+      OP_REQUIRES_OK(
+          ctx, EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &lhs));
+      Tensor contracted;
+      OP_REQUIRES_OK(ctx, EinsumHelper::AllocateBMatMulOutput<T>(
+                              ctx, lhs, b, false, false, &contracted));
+      OP_REQUIRES_OK(ctx, EinsumHelper::BMatMul<T>(
+                              ctx, lhs, b, false, false, &contracted));
+      Tensor output;
+      OP_REQUIRES_OK(ctx, EinsumHelper::TransposeOperand<T>(
+                              ctx, contracted, {1, 0, 2}, &output));
+      ctx->set_output(0, output);
+      return;
+    }
+
+    if (equation_ == "bte,tde->btd") {
+      OP_REQUIRES(ctx, b.dim_size(0) == a.dim_size(1) &&
+                           b.dim_size(2) == a.dim_size(2),
+                  errors::InvalidArgument("Invalid bte,tde->btd shapes"));
+      Tensor lhs;
+      OP_REQUIRES_OK(
+          ctx, EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &lhs));
+      Tensor contracted;
+      OP_REQUIRES_OK(ctx, EinsumHelper::AllocateBMatMulOutput<T>(
+                              ctx, lhs, b, false, true, &contracted));
+      OP_REQUIRES_OK(ctx, EinsumHelper::BMatMul<T>(
+                              ctx, lhs, b, false, true, &contracted));
+      Tensor output;
+      OP_REQUIRES_OK(ctx, EinsumHelper::TransposeOperand<T>(
+                              ctx, contracted, {1, 0, 2}, &output));
+      ctx->set_output(0, output);
+      return;
+    }
+
+    if (equation_ == "bte,btd->tde") {
+      OP_REQUIRES(ctx, b.dim_size(0) == a.dim_size(0) &&
+                           b.dim_size(1) == a.dim_size(1),
+                  errors::InvalidArgument("Invalid bte,btd->tde shapes"));
+      Tensor lhs;
+      OP_REQUIRES_OK(
+          ctx, EinsumHelper::TransposeOperand<T>(ctx, b, {1, 2, 0}, &lhs));
+      Tensor rhs;
+      OP_REQUIRES_OK(
+          ctx, EinsumHelper::TransposeOperand<T>(ctx, a, {1, 0, 2}, &rhs));
+      Tensor output;
+      OP_REQUIRES_OK(ctx, EinsumHelper::AllocateBMatMulOutput<T>(
+                              ctx, lhs, rhs, false, false, &output));
+      OP_REQUIRES_OK(ctx, EinsumHelper::BMatMul<T>(
+                              ctx, lhs, rhs, false, false, &output));
+      ctx->set_output(0, output);
+      return;
+    }
+
+    OP_REQUIRES(ctx, false,
+                errors::InvalidArgument("Unsupported MusaOneTrans3DEinsum "
+                                        "equation: ",
+                                        equation_));
+  }
+
+ private:
+  string equation_;
+};
 
 #define REGISTER_MUSA_EINSUM(TYPE)                             \
   REGISTER_KERNEL_BUILDER(                                     \
@@ -835,6 +1106,19 @@ REGISTER_MUSA_EINSUM(Eigen::half);
 REGISTER_MUSA_EINSUM(bfloat16);
 
 #undef REGISTER_MUSA_EINSUM
+
+#define REGISTER_MUSA_ONETRANS_3D_EINSUM(TYPE)                         \
+  REGISTER_KERNEL_BUILDER(Name("MusaOneTrans3DEinsum")                  \
+                              .Device("MUSA")                           \
+                              .TypeConstraint<TYPE>("T"),               \
+                          MusaOneTrans3DEinsumOp<TYPE>);
+
+REGISTER_MUSA_ONETRANS_3D_EINSUM(float);
+REGISTER_MUSA_ONETRANS_3D_EINSUM(double);
+REGISTER_MUSA_ONETRANS_3D_EINSUM(Eigen::half);
+REGISTER_MUSA_ONETRANS_3D_EINSUM(bfloat16);
+
+#undef REGISTER_MUSA_ONETRANS_3D_EINSUM
 
 }  // namespace musa
 }  // namespace tensorflow

@@ -39,9 +39,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from musa_test_utils import load_musa_plugin
 
 
-tf.disable_eager_execution()
-
-
 def build_graph_def() -> graph_pb2.GraphDef:
     with tf.Graph().as_default() as graph:
         with tf.device('/device:MUSA:0'):
@@ -71,16 +68,16 @@ def create_session_config() -> tf.ConfigProto:
 
 
 def load_latest_final_graph(dump_dir: Path):
-    final_pbtxts = sorted(
-        dump_dir.glob('*_final.pbtxt'), key=lambda path: path.stat().st_mtime
+    final_pbs = sorted(
+        dump_dir.glob('*_final.pb'), key=lambda path: path.stat().st_mtime
     )
-    if not final_pbtxts:
-        raise FileNotFoundError(f'No *_final.pbtxt found under {dump_dir}')
+    if not final_pbs:
+        raise FileNotFoundError(f'No *_final.pb found under {dump_dir}')
 
-    latest = final_pbtxts[-1]
+    latest = final_pbs[-1]
     graph_def = graph_pb2.GraphDef()
-    with latest.open('r', encoding='utf-8') as handle:
-        text_format.Parse(handle.read(), graph_def)
+    with latest.open('rb') as handle:
+        graph_def.ParseFromString(handle.read())
     return graph_def, latest
 
 
@@ -102,6 +99,7 @@ def save_graph(graph_def: graph_pb2.GraphDef, pbtxt_path: Path, pb_path: Path) -
 
 
 def main() -> None:
+    tf.disable_eager_execution()
     default_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description='Generate graph artifacts that exercise RemoveIsolatedNodes.'
@@ -186,4 +184,5 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    tf.disable_eager_execution()
     main()

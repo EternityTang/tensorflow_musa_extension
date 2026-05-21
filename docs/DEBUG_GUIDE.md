@@ -10,7 +10,27 @@
 
 ### 1.1 启用遥测
 
-通过环境变量启用和配置遥测系统：
+推荐在 Python 测试代码中通过接口启用和配置遥测系统。接口会覆盖同名
+`MUSA_TELEMETRY_*` 环境变量，适合在单测中按 case 打开、关闭或切换日志路径：
+
+```python
+import tensorflow_musa as tf_musa
+
+tf_musa.set_musa_telemetry_config(
+    enabled=True,
+    log_path="/tmp/musa_telemetry.json",
+    buffer_size=50000,
+    flush_interval_ms=50,
+    include_stack_trace=True,
+)
+
+print(tf_musa.is_musa_telemetry_enabled())
+print(tf_musa.get_musa_telemetry_health())
+
+tf_musa.disable_musa_telemetry()
+```
+
+也可以通过环境变量提供进程启动时的默认配置：
 
 | 变量名 | 说明 | 默认值 | 示例 |
 |--------|------|--------|------|
@@ -141,6 +161,8 @@ with open('/tmp/musa_telemetry.json') as f:
 | `MUSA_ENABLE_TF32` | 启用 TF32 加速 MatMul/Conv | `export MUSA_ENABLE_TF32=1` |
 | `MUSA_DUMP_GRAPHDEF` | 启用图优化调试，dump GraphDef | `export MUSA_DUMP_GRAPHDEF=1` |
 | `MUSA_DUMP_GRAPHDEF_DIR` | 指定 GraphDef dump 目录 | `export MUSA_DUMP_GRAPHDEF_DIR=/tmp/graphs` |
+| `MUSA_DUMP_GRAPHDEF_TEXT` | 同时输出 pbtxt 文本格式 | `export MUSA_DUMP_GRAPHDEF_TEXT=1` |
+| `MUSA_DUMP_GRAPHDEF_SLIM` | 同时输出精简版 slim pb | `export MUSA_DUMP_GRAPHDEF_SLIM=1` |
 | `MUSA_AUTO_MIXED_PRECISION` | 启用自动混合精度（AMP） | `export MUSA_AUTO_MIXED_PRECISION=1` |
 | `MUSA_AMP_MODE` | AMP 精度模式（`FP16` 或 `BF16`） | `export MUSA_AMP_MODE=FP16` |
 | `MUSA_DISABLE_GRAPPLER` | 禁用 Grappler 图优化 | `export MUSA_DISABLE_GRAPPLER=1` |
@@ -191,10 +213,24 @@ python -m fusion.layernorm_gelu_fusion_test
 export TF_CPP_VMODULE="layernorm_fusion=2,gelu_fusion=1"
 python -m fusion.layernorm_gelu_fusion_test
 
-# Dump GraphDef
-export MUSA_DUMP_GRAPHDEF=1
-export MUSA_DUMP_GRAPHDEF_DIR=/tmp/graphs
-python test_runner.py
+# 兼容方式：通过环境变量提供默认值
+# export MUSA_DUMP_GRAPHDEF=1
+# export MUSA_DUMP_GRAPHDEF_DIR=/tmp/graphs
+# python test_runner.py
+```
+
+推荐在测试代码中通过 Python 接口打开 GraphDef dump。接口配置会覆盖
+`MUSA_DUMP_GRAPHDEF*` 环境变量：
+
+```python
+import tensorflow_musa as tf_musa
+
+tf_musa.set_musa_graph_dump_config(
+    enabled=True,
+    dump_dir="/tmp/graphs",
+    dump_text=True,
+    dump_slim=True,
+)
 ```
 
 ### 3.3 脏数据诊断

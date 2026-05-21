@@ -26,14 +26,14 @@ class AddOpTest(MUSATestCase):
 
   def _test_add(self, shape_x, shape_y, dtype, rtol=1e-5, atol=1e-8):
     """Test add operation with given shapes and dtype."""
-    np_dtype = np.float32 if dtype == tf.bfloat16 else dtype.as_numpy_dtype
-    
+    np_dtype = dtype.as_numpy_dtype
+
     x_np = np.random.uniform(-1, 1, size=shape_x).astype(np_dtype)
     y_np = np.random.uniform(-1, 1, size=shape_y).astype(np_dtype)
-    
+
     x = tf.constant(x_np, dtype=dtype)
     y = tf.constant(y_np, dtype=dtype)
-    
+
     self._compare_cpu_musa_results(tf.add, [x, y], dtype, rtol=rtol, atol=atol)
 
   def testAddBasic(self):
@@ -89,6 +89,19 @@ class AddOpTest(MUSATestCase):
     for dtype in [tf.float32, tf.float16]:
       rtol = 1e-2 if dtype == tf.float16 else 1e-5
       atol = 1e-2 if dtype == tf.float16 else 1e-8
+      for shape_x, shape_y in test_cases:
+        self._test_add(shape_x, shape_y, dtype, rtol=rtol, atol=atol)
+
+  def testAddFastPathHotShapes(self):
+    """Test add hot shapes covered by custom fast paths."""
+    test_cases = [
+        ([1024, 1024], [1024, 1024]),
+        ([1024, 1024], []),
+        ([1024, 1024], [1024]),
+    ]
+    for dtype in [tf.float32, tf.float16, tf.bfloat16]:
+      rtol = 1e-2 if dtype in [tf.float16, tf.bfloat16] else 1e-5
+      atol = 1e-2 if dtype in [tf.float16, tf.bfloat16] else 1e-8
       for shape_x, shape_y in test_cases:
         self._test_add(shape_x, shape_y, dtype, rtol=rtol, atol=atol)
 

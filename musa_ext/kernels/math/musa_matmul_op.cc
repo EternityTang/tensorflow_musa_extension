@@ -54,7 +54,7 @@ class MusaMatMulOp : public MusaOpKernel {
       if (tf32_env) {
         return std::atoi(tf32_env) != 0;
       }
-      return false;  // Default: TF32 enabled for performance
+      return true;  // Default: TF32 enabled for performance
     }();
     tf32_enabled_ = tf32_enabled_global;
   }
@@ -94,11 +94,19 @@ class MusaMatMulOp : public MusaOpKernel {
     Tensor* out = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
     if (out->NumElements() == 0) return;
+
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
+    auto& handle = GetHandleByCtx(ctx);
+
+    // When inner dim k == 0, inputs have NumElements == 0 but the output
+    // (m x n or batch x m x n) is non-empty and must be zero-filled.
+    // flat<T>().setZero() is a CPU Eigen op and must NOT be called on device
+    // memory — that causes a segfault. Use musaMemsetAsync instead.
     if (in0.NumElements() == 0 || in1.NumElements() == 0) {
-      auto flat_out = out->flat<T>();
+      musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+      musaMemsetAsync(out->data(), 0, out->TotalBytes(), stream);
       return;
     }
-    auto& handle = GetHandleByCtx(ctx);
     handle.SetAllowTF32(tf32_enabled_);  // Use TF32 setting from constructor
     mTensor mt_a = CreateMTensor(in0);
     mTensor mt_b = CreateMTensor(in1);
@@ -167,7 +175,7 @@ class MusaMatMulOp : public MusaOpKernel {
  private:
   bool trans_a_ = false;
   bool trans_b_ = false;
-  bool tf32_enabled_ = false;  // TF32 acceleration enabled by default
+  bool tf32_enabled_ = true;  // TF32 acceleration enabled by default
 };
 
 #define REGISTER_MUSA_MATMUL_ALL(TYPE)                                    \

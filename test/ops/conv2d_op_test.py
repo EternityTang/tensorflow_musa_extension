@@ -18,7 +18,7 @@ class Conv2DOpTest(MUSATestCase):
 
   def _make_input_and_filter(self, input_shape, filter_shape, dtype, seed=2026):
     np.random.seed(seed)
-    np_dtype = np.float32 if dtype == tf.bfloat16 else dtype.as_numpy_dtype
+    np_dtype = dtype.as_numpy_dtype
     x_np = np.random.uniform(-1.0, 1.0, size=input_shape).astype(np_dtype)
     w_np = np.random.uniform(-1.0, 1.0, size=filter_shape).astype(np_dtype)
     return tf.constant(x_np, dtype=dtype), tf.constant(w_np, dtype=dtype)
@@ -169,13 +169,19 @@ class Conv2DOpTest(MUSATestCase):
 
   def testConv2DEmptyBatch(self):
     """Empty batch should return empty output."""
-    self._test_conv2d(
+    x, w = self._make_input_and_filter(
         input_shape=[0, 8, 8, 3],
         filter_shape=[3, 3, 3, 4],
-        dtype=tf.float32,
-        strides=[1, 1, 1, 1],
-        padding="SAME",
-        data_format="NHWC")
+        dtype=tf.float32)
+    with tf.device('/device:MUSA:0'):
+      musa_result = tf.nn.conv2d(
+          x,
+          w,
+          strides=[1, 1, 1, 1],
+          padding="SAME",
+          data_format="NHWC")
+    self.assertAllEqual(musa_result.shape.as_list(), [0, 8, 8, 4])
+    self.assertEqual(musa_result.numpy().size, 0)
 
   def testConv2DAsymmetricSamePaddingUnsupported(self):
     """Current MUSA implementation rejects asymmetric SAME padding."""

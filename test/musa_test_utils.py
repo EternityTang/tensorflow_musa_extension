@@ -45,6 +45,7 @@ def load_musa_ops():
   return tensorflow_musa.get_musa_ops()
 
 
+
 # Import tensorflow first (load_musa_plugin needs it)
 import tensorflow as tf
 
@@ -54,6 +55,11 @@ load_musa_plugin()
 
 class MUSATestCase(tf.test.TestCase):
   """Base test class for MUSA kernel tests."""
+
+  # Prevent unittest from treating tf.test.TestCase.test_session (a TF1
+  # context-manager helper) as an actual test case, which causes it to run
+  # slowly as a spurious test.
+  test_session = None
 
   @classmethod
   def setUpClass(cls):

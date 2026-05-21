@@ -19,8 +19,8 @@
 Typical workflow:
 1. Run the whole model once with GELU fusion enabled and dump after_fusion pb.
 2. Run this script with GELU fusion enabled to benchmark the fused path.
-3. Re-run this script in a fresh process with `MUSA_DISABLE_GELU_FUSION=1`
-   to benchmark the fallback path over the exact same shape set.
+3. Re-run this script with `--disable-gelu-fusion` to benchmark the fallback
+   path over the exact same shape set.
 4. Compare the generated JSON result files.
 """
 
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from collections import OrderedDict
@@ -41,19 +40,11 @@ import tensorflow.compat.v1 as tf
 from tensorflow.core.framework import graph_pb2
 from tensorflow.core.protobuf import config_pb2
 
-tf.disable_eager_execution()
-
 ROOT_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_DIR = ROOT_DIR.parent
 DEFAULT_FUSED_GRAPH = ROOT_DIR / "gelu_big_graphs_pb" / "musa_optimizer_0002_after_fusion.pb"
 DEFAULT_MODEL_GRAPH = WORKSPACE_DIR / "tf_test_model" / "prunedGraph" / "graph_def.pb"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "test" / "fusion" / "benchmark_results"
-
-
-def is_truthy_env(value: Optional[str]) -> bool:
-  if value is None:
-    return False
-  return value in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 
 
 def clean_input_name(input_name: str) -> str:
@@ -174,12 +165,16 @@ def load_musa_plugin() -> str:
   return tensorflow_musa.load_plugin()
 
 
-def create_config_with_musa_optimizer() -> config_pb2.ConfigProto:
+def create_config_with_musa_optimizer(
+    gelu_fusion_enabled: bool = True,
+) -> config_pb2.ConfigProto:
   config = config_pb2.ConfigProto()
   config.allow_soft_placement = True
   rewriter_config = config.graph_options.rewrite_options
   custom_optimizer = rewriter_config.custom_optimizers.add()
   custom_optimizer.name = "musa_graph_optimizer"
+  if not gelu_fusion_enabled:
+    custom_optimizer.parameter_map["disabled_fusion_patterns"].s = b"MusaGeluFusion"
   rewriter_config.min_graph_nodes = -1
   rewriter_config.optimizers.extend(["musa_graph_optimizer"])
   return config
@@ -316,12 +311,15 @@ def benchmark_case(
     warmup_rounds: int,
     benchmark_rounds: int,
     seed: int,
+    gelu_fusion_enabled: bool,
 ) -> Dict[str, object]:
   graph, x, output = build_exact_gelu_graph(shape, approximate)
   rng = np.random.RandomState(seed)
   x_np = rng.standard_normal(shape).astype(np.float32)
 
-  config = create_config_with_musa_optimizer()
+  config = create_config_with_musa_optimizer(
+      gelu_fusion_enabled=gelu_fusion_enabled,
+  )
   times: List[float] = []
   with tf.Session(graph=graph, config=config) as sess:
     for _ in range(warmup_rounds):
@@ -525,6 +523,14 @@ def parse_args() -> argparse.Namespace:
       help="Only extract the whole-model GELU cases; skip benchmarking.",
   )
   parser.add_argument(
+      "--disable-gelu-fusion",
+      action="store_true",
+      help=(
+          "Benchmark the fallback GELU path by disabling MusaGeluFusion through "
+          "the MUSA graph optimizer config."
+      ),
+  )
+  parser.add_argument(
       "--compare-json",
       nargs=2,
       metavar=("FUSION_ON_JSON", "FUSION_OFF_JSON"),
@@ -534,6 +540,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+  tf.disable_eager_execution()
   args = parse_args()
 
   if args.compare_json:
@@ -548,9 +555,10 @@ def main() -> None:
   print(f"Using fused graph: {fused_graph_path}")
   print(f"Using model graph: {model_graph_path}")
   print(f"Batch size for runtime shape materialization: {args.batch_size}")
+  gelu_fusion_enabled = not args.disable_gelu_fusion
   print(
       "Fusion mode for this benchmark process: "
-      + ("fusion_off" if is_truthy_env(os.environ.get("MUSA_DISABLE_GELU_FUSION")) else "fusion_on")
+      + ("fusion_on" if gelu_fusion_enabled else "fusion_off")
   )
 
   fused_graph_def = load_graph_def(fused_graph_path)
@@ -590,11 +598,12 @@ def main() -> None:
         warmup_rounds=args.warmup_rounds,
         benchmark_rounds=args.benchmark_rounds,
         seed=args.seed + idx,
+        gelu_fusion_enabled=gelu_fusion_enabled,
     )
 
   summary = summarize_results(
       case_specs,
-      fusion_enabled=not is_truthy_env(os.environ.get("MUSA_DISABLE_GELU_FUSION")),
+      fusion_enabled=gelu_fusion_enabled,
   )
   print_benchmark_summary(summary)
 

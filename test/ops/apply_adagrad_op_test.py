@@ -36,7 +36,7 @@ class ApplyAdagradV2OpTest(MUSATestCase):
     self.musa_device = musa_devices[0]
 
   def _numpy_dtype(self, dtype):
-    return np.float32 if dtype == tf.bfloat16 else dtype.as_numpy_dtype
+    return dtype.as_numpy_dtype
 
   def _assert_by_dtype(self, expected, actual, dtype):
     if dtype in [tf.float16, tf.bfloat16]:
@@ -70,34 +70,24 @@ class ApplyAdagradV2OpTest(MUSATestCase):
                                      grad_np,
                                      dtype,
                                      use_locking=False):
-    graph = tf.Graph()
-    with graph.as_default():
-      with tf.device(device):
-        var = tf.Variable(init_var_np, dtype=dtype, name="var")
-        accum = tf.Variable(init_accum_np, dtype=dtype, name="accum")
-        grad = tf.constant(grad_np, dtype=dtype, name="grad")
+    with tf.device(device):
+      var = tf.Variable(init_var_np, dtype=dtype)
+      accum = tf.Variable(init_accum_np, dtype=dtype)
+      grad = tf.constant(grad_np, dtype=dtype)
 
-      with tf.device("/CPU:0"):
-        lr = tf.constant(lr_np, dtype=dtype, name="lr")
-        epsilon = tf.constant(epsilon_np, dtype=dtype, name="epsilon")
+    with tf.device("/CPU:0"):
+      lr = tf.constant(lr_np, dtype=dtype)
+      epsilon = tf.constant(epsilon_np, dtype=dtype)
 
-      update = tf.raw_ops.ResourceApplyAdagradV2(
-          var=var.handle,
-          accum=accum.handle,
-          lr=lr,
-          epsilon=epsilon,
-          grad=grad,
-          use_locking=use_locking)
+    tf.raw_ops.ResourceApplyAdagradV2(
+        var=var.handle,
+        accum=accum.handle,
+        lr=lr,
+        epsilon=epsilon,
+        grad=grad,
+        use_locking=use_locking)
 
-      with tf.control_dependencies([update]):
-        read_var = tf.identity(var.read_value(), name="updated_var")
-        read_accum = tf.identity(accum.read_value(), name="updated_accum")
-
-      init_op = tf.compat.v1.global_variables_initializer()
-
-    with tf.compat.v1.Session(graph=graph) as sess:
-      sess.run(init_op)
-      return sess.run(read_var), sess.run(read_accum)
+    return var.numpy(), accum.numpy()
 
   def testResourceApplyAdagradV2Basic(self):
     """Test basic ResourceApplyAdagradV2 operation."""
@@ -164,6 +154,31 @@ class ApplyAdagradV2OpTest(MUSATestCase):
 
         self._assert_by_dtype(cpu_var, musa_var, dtype)
         self._assert_by_dtype(cpu_accum, musa_accum, dtype)
+
+  def testResourceApplyAdagradV2FusedLargeTensorFloat32(self):
+    """Test ResourceApplyAdagradV2 correctness on the fused large tensor path."""
+    dtype = tf.float32
+    shape = (1024, 1024)
+    rng = np.random.default_rng(123)
+
+    init_var_np = rng.normal(loc=0.0, scale=0.1, size=shape).astype(np.float32)
+    init_accum_np = (
+        rng.random(shape).astype(np.float32) + np.float32(0.1)
+    )
+    grad_np = (
+        rng.normal(loc=0.0, scale=0.01, size=shape).astype(np.float32)
+    )
+    lr_np = np.float32(0.01)
+    epsilon_np = np.float32(1e-7)
+
+    expected_var, expected_accum = self._expected_apply_adagrad_v2(
+        init_var_np, init_accum_np, lr_np, epsilon_np, grad_np)
+    musa_var, musa_accum = self._run_resource_apply_adagrad_v2(
+        "/device:MUSA:0", init_var_np, init_accum_np, lr_np, epsilon_np,
+        grad_np, dtype)
+
+    self._assert_by_dtype(expected_var, musa_var, dtype)
+    self._assert_by_dtype(expected_accum, musa_accum, dtype)
 
   def testResourceApplyAdagradV2WithUseLocking(self):
     """Test ResourceApplyAdagradV2 with use_locking=True."""

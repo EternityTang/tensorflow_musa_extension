@@ -1,17 +1,64 @@
+#include <cstdint>
+
+#include "../utils_op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/types.h"
-#include "../utils_op.h"
 
 namespace tensorflow {
 namespace musa {
+
+extern "C" {
+void LaunchMusaCastFloatToBFloat16(const void* src, void* dst, int64_t n,
+                                   musaStream_t stream);
+void LaunchMusaCastBFloat16ToFloat(const void* src, void* dst, int64_t n,
+                                   musaStream_t stream);
+void LaunchMusaCastBoolToBFloat16(const void* src, void* dst, int64_t n,
+                                  musaStream_t stream);
+}
+
+namespace {
+
+bool TryLaunchFastCast(OpKernelContext* ctx, DataType src_dtype,
+                       DataType dst_dtype, const Tensor& input,
+                       Tensor* output) {
+  const int64_t num_elements = input.NumElements();
+  if (num_elements <= 0) return false;
+
+  const void* src = input.tensor_data().data();
+  void* dst = const_cast<char*>(output->tensor_data().data());
+  musaStream_t stream = GetMusaStreamByCtx(ctx);
+  bool launched = true;
+
+  if (src_dtype == DT_FLOAT && dst_dtype == DT_BFLOAT16) {
+    LaunchMusaCastFloatToBFloat16(src, dst, num_elements, stream);
+  } else if (src_dtype == DT_BFLOAT16 && dst_dtype == DT_FLOAT) {
+    LaunchMusaCastBFloat16ToFloat(src, dst, num_elements, stream);
+  } else if (src_dtype == DT_BOOL && dst_dtype == DT_BFLOAT16) {
+    LaunchMusaCastBoolToBFloat16(src, dst, num_elements, stream);
+  } else {
+    launched = false;
+  }
+
+  if (!launched) return false;
+
+  auto status = musaGetLastError();
+  if (status != musaSuccess) {
+    ctx->CtxFailure(errors::Internal("MUSA Cast fast path launch failed: ",
+                                     musaGetErrorString(status)));
+  }
+  return true;
+}
+
+}  // namespace
 
 class MusaCastOp : public MusaOpKernel {
  public:
   explicit MusaCastOp(OpKernelConstruction* ctx) : MusaOpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("SrcT", &external_src_dtype_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("DstT", &external_dst_dtype_));
-    // Cache identity check for zero-copy fast path (matches TensorFlow's CastOpBase)
+    // Cache identity check for zero-copy fast path (matches TensorFlow's
+    // CastOpBase)
     is_identity_cast_ = (external_src_dtype_ == external_dst_dtype_);
   }
 
@@ -30,14 +77,19 @@ class MusaCastOp : public MusaOpKernel {
       return;
     }
 
-    // Early exit for empty tensors - still need to allocate output with correct shape
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, inp.shape(), &output));
+
     if (inp.NumElements() == 0) {
-      ctx->set_output(0, inp);
+      // No need to run muDNN for empty tensors. Just return the zero-element
+      // output tensor (already allocated above).
       return;
     }
 
-    Tensor* output = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, inp.shape(), &output));
+    if (TryLaunchFastCast(ctx, external_src_dtype_, external_dst_dtype_, inp,
+                          output)) {
+      return;
+    }
 
     auto in_mt = CreateMTensor(inp);
     auto out_mt = CreateMTensor(*output);
@@ -47,6 +99,7 @@ class MusaCastOp : public MusaOpKernel {
       in_mt.SetFormat(mFormat::NCHW);
     }
 
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     mHandle& h = GetHandleByCtx(ctx);
     ::musa::dnn::Unary op;
 

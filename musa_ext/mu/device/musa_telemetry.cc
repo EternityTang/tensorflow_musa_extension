@@ -231,6 +231,8 @@ MusaTelemetry::MusaTelemetry() : output_file_(nullptr) {}
 MusaTelemetry::~MusaTelemetry() { Shutdown(); }
 
 void MusaTelemetry::Initialize(const TelemetryConfig& config) {
+  Shutdown();
+
   config_ = config;
 
   if (!config_.enabled) {

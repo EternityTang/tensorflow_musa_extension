@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <list>
+#include <type_traits>
 #include <vector>
 
 #include "../array/musa_fill_functor.h"
@@ -15,8 +17,56 @@
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 
+extern "C" {
+void LaunchApplyAdamSameType_BFloat16(void* var, void* m, void* v,
+                                      const void* grad, float lr_t, float beta1,
+                                      float beta2, float epsilon, int64_t n,
+                                      bool use_nesterov, musaStream_t stream);
+void LaunchApplyAdamSameType_Half(void* var, void* m, void* v, const void* grad,
+                                  float lr_t, float beta1, float beta2,
+                                  float epsilon, int64_t n, bool use_nesterov,
+                                  musaStream_t stream);
+}
+
 namespace tensorflow {
 namespace musa {
+
+void LaunchResourceApplyAdamFloat(float* var, float* m, float* v,
+                                  const float* grad, float beta1,
+                                  float beta2, float epsilon, float alpha,
+                                  int64_t total, musaStream_t stream);
+
+namespace {
+
+template <typename T>
+struct AdamSameTypeFP32Path {
+  static constexpr bool kEnabled = false;
+};
+
+template <>
+struct AdamSameTypeFP32Path<bfloat16> {
+  static constexpr bool kEnabled = true;
+};
+
+template <>
+struct AdamSameTypeFP32Path<Eigen::half> {
+  static constexpr bool kEnabled = true;
+};
+
+inline void DispatchAdamSameType(DataType dtype, void* var, void* m, void* v,
+                                 const void* grad, float lr_t, float beta1,
+                                 float beta2, float epsilon, int64_t n,
+                                 bool use_nesterov, musaStream_t stream) {
+  if (dtype == DT_BFLOAT16) {
+    LaunchApplyAdamSameType_BFloat16(var, m, v, grad, lr_t, beta1, beta2,
+                                     epsilon, n, use_nesterov, stream);
+  } else {
+    LaunchApplyAdamSameType_Half(var, m, v, grad, lr_t, beta1, beta2, epsilon,
+                                 n, use_nesterov, stream);
+  }
+}
+
+}  // namespace
 
 // Keep Adam-related kernels in one translation unit so similarly shaped helper
 // classes do not end up with duplicate names across different .cc files.
@@ -29,7 +79,7 @@ Status CopyTensorForUpdate(OpKernelContext* ctx, const Tensor& src,
   TF_RETURN_IF_ERROR(ctx->allocate_temp(src.dtype(), src.shape(), dst, attr));
 
   if (src.TotalBytes() == 0) {
-    return Status::OK();
+    return OkStatus();
   }
 
   // Use musaMemcpyAsync for same-device memory copy
@@ -41,18 +91,18 @@ Status CopyTensorForUpdate(OpKernelContext* ctx, const Tensor& src,
                             musaGetErrorString(err));
   }
 
-  return Status::OK();
+  return OkStatus();
 }
 
 Status PrepareTensorForMusaUpdate(OpKernelContext* ctx, Var* var) {
   if (!var->copy_on_read_mode.load() && var->tensor()->RefCountIsOne()) {
-    return Status::OK();
+    return OkStatus();
   }
 
   Tensor copied;
   TF_RETURN_IF_ERROR(CopyTensorForUpdate(ctx, *var->tensor(), &copied));
   *var->tensor() = copied;
-  return Status::OK();
+  return OkStatus();
 }
 
 class MutexUnlocker {
@@ -144,6 +194,7 @@ class MusaResourceApplyAdamOp : public MusaOpKernel {
     m_t = *m->tensor();
     v_t = *v->tensor();
 
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);
     std::list<Tensor> temp_storage;
     ::musa::dnn::Binary b_op;
@@ -155,7 +206,7 @@ class MusaResourceApplyAdamOp : public MusaOpKernel {
         return errors::Internal("ResourceApplyAdam ", op_name,
                                 " failed. Status: ", static_cast<int>(status));
       }
-      return Status::OK();
+      return OkStatus();
     };
 
     auto fill_scalar = [&](T val, const TensorShape& shape,
@@ -192,6 +243,47 @@ class MusaResourceApplyAdamOp : public MusaOpKernel {
       alpha_val = static_cast<double>(lr) *
                   std::sqrt(1.0 - static_cast<double>(beta2_power)) /
                   one_minus_beta1_power;
+    }
+
+    if constexpr (std::is_same<T, float>::value) {
+      if (!use_nesterov_) {
+        const int64_t total = var_t.NumElements();
+        if (total > 0) {
+          LaunchResourceApplyAdamFloat(
+              var_t.flat<float>().data(), m_t.flat<float>().data(),
+              v_t.flat<float>().data(), grad.flat<float>().data(),
+              static_cast<float>(beta1), static_cast<float>(beta2),
+              static_cast<float>(epsilon), static_cast<float>(alpha_val),
+              total, GetMusaStreamByCtx(ctx));
+          const musaError_t launch_err = musaGetLastError();
+          OP_REQUIRES(ctx, launch_err == musaSuccess,
+                      errors::Internal("ResourceApplyAdam fused launch failed: ",
+                                       musaGetErrorString(launch_err)));
+        }
+        return;
+      }
+    }
+
+    if (AdamSameTypeFP32Path<T>::kEnabled && var_t.NumElements() > 0 &&
+        std::getenv("MUSA_DISABLE_ADAM_BF16") == nullptr) {
+      musaStream_t stream = GetMusaStreamByCtx(ctx);
+      DispatchAdamSameType(
+          var_t.dtype(),
+          const_cast<void*>(
+              static_cast<const void*>(var_t.tensor_data().data())),
+          const_cast<void*>(static_cast<const void*>(m_t.tensor_data().data())),
+          const_cast<void*>(static_cast<const void*>(v_t.tensor_data().data())),
+          static_cast<const void*>(grad.tensor_data().data()),
+          static_cast<float>(alpha_val), static_cast<float>(beta1),
+          static_cast<float>(beta2), static_cast<float>(epsilon),
+          var_t.NumElements(), /*use_nesterov=*/false, stream);
+      musaError_t sync_err = musaStreamSynchronize(stream);
+      OP_REQUIRES(
+          ctx, sync_err == musaSuccess,
+          errors::Internal("ResourceApplyAdam (bf16/fp16 fp32-compute path): "
+                           "musaStreamSynchronize failed: ",
+                           musaGetErrorString(sync_err)));
+      return;
     }
 
     // // Log shapes for debugging
@@ -273,20 +365,19 @@ class MusaResourceApplyAdamOp : public MusaOpKernel {
     temp_storage.emplace_back();
     OP_REQUIRES_OK(ctx, ctx->allocate_temp(DataTypeToEnum<T>::value,
                                            v_t.shape(), &temp_storage.back()));
-    mTensor t_v_plus_eps = CreateMTensor(temp_storage.back(), format_);
-    b_op.SetMode(::musa::dnn::Binary::Mode::ADD);
+    mTensor t_sqrt_v = CreateMTensor(temp_storage.back(), format_);
+    u_op.SetMode(::musa::dnn::Unary::Mode::SQRT);
     OP_REQUIRES_OK(ctx,
-                   require_success(b_op.Run(handle, t_v_plus_eps, t_v, t_eps),
-                                   "ADD epsilon"));
+                   require_success(u_op.Run(handle, t_sqrt_v, t_v), "SQRT v"));
 
     temp_storage.emplace_back();
     OP_REQUIRES_OK(ctx, ctx->allocate_temp(DataTypeToEnum<T>::value,
                                            v_t.shape(), &temp_storage.back()));
-    mTensor t_sqrt_v = CreateMTensor(temp_storage.back(), format_);
-    u_op.SetMode(::musa::dnn::Unary::Mode::SQRT);
+    mTensor t_v_plus_eps = CreateMTensor(temp_storage.back(), format_);
+    b_op.SetMode(::musa::dnn::Binary::Mode::ADD);
     OP_REQUIRES_OK(
-        ctx,
-        require_success(u_op.Run(handle, t_sqrt_v, t_v_plus_eps), "SQRT v"));
+        ctx, require_success(b_op.Run(handle, t_v_plus_eps, t_sqrt_v, t_eps),
+                             "ADD epsilon"));
 
     // Step 4: update = m / denom
     temp_storage.emplace_back();
@@ -295,9 +386,9 @@ class MusaResourceApplyAdamOp : public MusaOpKernel {
                                       &temp_storage.back()));
     mTensor t_update = CreateMTensor(temp_storage.back(), format_);
     b_op.SetMode(::musa::dnn::Binary::Mode::DIV);
-    OP_REQUIRES_OK(ctx,
-                   require_success(b_op.Run(handle, t_update, t_m, t_sqrt_v),
-                                   "DIV update"));
+    OP_REQUIRES_OK(
+        ctx, require_success(b_op.Run(handle, t_update, t_m, t_v_plus_eps),
+                             "DIV update"));
 
     // Step 5: update = update * alpha
     temp_storage.emplace_back();
@@ -387,6 +478,7 @@ class MusaApplyAdamKernelOp : public MusaOpKernel {
     const T epsilon = ctx->input(8).scalar<T>()();
     // grad already declared above for shape validation
 
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);
     std::list<Tensor> temp_storage;
 
@@ -419,6 +511,31 @@ class MusaApplyAdamKernelOp : public MusaOpKernel {
       alpha_val = static_cast<double>(lr) *
                   std::sqrt(1.0 - static_cast<double>(beta2_power)) /
                   one_minus_beta1_power;
+    }
+
+    if (AdamSameTypeFP32Path<T>::kEnabled && var_t->NumElements() > 0 &&
+        std::getenv("MUSA_DISABLE_ADAM_BF16") == nullptr) {
+      musaStream_t stream = GetMusaStreamByCtx(ctx);
+      DispatchAdamSameType(
+          var_t->dtype(),
+          const_cast<void*>(
+              static_cast<const void*>(var_t->tensor_data().data())),
+          const_cast<void*>(
+              static_cast<const void*>(m_t->tensor_data().data())),
+          const_cast<void*>(
+              static_cast<const void*>(v_t->tensor_data().data())),
+          static_cast<const void*>(grad.tensor_data().data()),
+          static_cast<float>(alpha_val), static_cast<float>(beta1),
+          static_cast<float>(beta2), static_cast<float>(epsilon),
+          var_t->NumElements(), /*use_nesterov=*/false, stream);
+      if (IsRefType(ctx->input_dtype(0))) {
+        ctx->forward_ref_input_to_ref_output(0, 0);
+      } else {
+        for (int i = 0; i < ctx->num_outputs(); ++i) {
+          ctx->set_output(i, ctx->input(i));
+        }
+      }
+      return;
     }
 
     mTensor t_beta1;
