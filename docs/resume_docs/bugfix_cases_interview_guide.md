@@ -38,18 +38,37 @@ MMU: Fault (Page Directory) — 访问地址 0x003ece8fcd80，远小于 GPU 地�
 
 **MUSA runtime 的 `musaStreamWaitEvent` GPU 侧异步等待在 TensorFlow 复杂环境下不可靠。**
 
-TensorFlow 的 H2D 拷贝流程：
+TensorFlow 的 H2D 拷贝流程里有两个不同方向的同步问题：
+
+1. **H2D 之前：compute→H2D**
+   - 目的：防止 H2D 写入的 `dst` device buffer 仍被前一个 compute kernel 使用
+   - 典型原因：BFCAllocator 复用了一块刚释放但 GPU 侧可能尚未真正用完的 device memory
+   - 这个场景通常是防御性同步，普通 feed H2D 下不是主路径
+
+2. **H2D 之后：H2D→后续 compute**
+   - 目的：防止依赖该输入的后续 compute kernel 在 H2D 数据真正到达前启动
+   - 本次 `MUSA_ERROR_ILLEGAL_ADDRESS` 的核心问题在这个方向
+
+旧的 H2D→compute 流程：
 1. `CopyCPUTensorToDevice` 在 `h2d_stream_` 上执行 `musaMemcpyAsync`
 2. 通过 `musaEventRecord` + `musaStreamWaitEvent` 通知 compute stream 等待
 3. API 返回 `musaSuccess`，但 compute stream 并未真正等待 H2D 完成
-4. Compute kernel 在数据到达 GPU 前就开始执行，读到未映射的 GPU 内存
+4. `done()` 过早返回，TensorFlow 调度后续 compute kernel
+5. Compute kernel 在数据到达 GPU 前就开始执行，读到未映射的 GPU 内存
 
 **时序图**：
 ```
 旧方案（失败）：
-  h2d_stream_:   [memcpy_async] → event_record
-  stream_handle_: stream_wait_event(不可靠) → [compute kernel] ← 数据可能未就绪
-  host:           done() 立即调用 → TF 调度 compute kernel
+  h2d_stream_:     [memcpy_async] → event_record
+  stream_handle_:  stream_wait_event(不可靠) → [compute kernel] ← 数据可能未就绪
+  host:            done() 立即调用 → TF 过早调度依赖该输入的 compute kernel
+
+真正出错方向：
+  H2D 尚未完成  →  后续 compute 已经读取 dst
+
+不是主因的方向：
+  previous compute  →  H2D 写 dst
+  这个由 sync_dst_compute 防御性处理，主要防 allocator 复用导致的覆盖风险。
 ```
 
 纯 MUSA runtime 的独立测试中 `musaStreamWaitEvent` 正常工作，问题仅在 TF 环境下复现，与大量并发、muDNN 算子、BFCAllocator、EventMgr 线程等 TF 特有因素有关。
@@ -80,20 +99,21 @@ TensorFlow 的 H2D 拷贝流程：
 - 将 H2D 改到 compute stream（同 stream）→ **成功**
 
 **阶段六：精确验证 `musaStreamWaitEvent` 无效**
-- 添加诊断日志：`sync_dst_compute` 始终为 true，event/wait 确实执行了，API 返回成功
-- `musaEventSynchronize`（host 阻塞等待）→ **成功**
+- 添加诊断日志：H2D→compute 的 event/wait 确实执行了，API 返回成功
+- `musaEventSynchronize`（host 阻塞等待 H2D event）→ **成功**
 - 去掉 `musaStreamWaitEvent`，只留 `musaEventSynchronize` → **仍然成功**
-- **结论：`musaStreamWaitEvent` 完全无效**
+- **结论：失败点不是 H2D copy 本身，而是 H2D→后续 compute 的 GPU 侧跨 stream wait 没有可靠生效**
 
 ### 1.4 解决方案
 
 **实际采用方案：`ThenExecute` 回调（非阻塞 host 侧完成通知）**
 
 ```cpp
-// 1. sync_dst_compute: compute→H2D 方向同步（可靠方向）
+// 1. 可选的 H2D 前置保护：compute→H2D
+//    只在 dst 可能复用 compute stream 尚未完成的 device buffer 时需要。
 if (sync_dst_compute) {
-    musaEventRecord(sync_event, stream_handle_);     // compute 完成
-    musaStreamWaitEvent(h2d_stream_, sync_event, 0);  // h2d 等 compute
+    musaEventRecord(sync_event, stream_handle_);     // previous compute 完成
+    musaStreamWaitEvent(h2d_stream_, sync_event, 0);  // h2d 等 previous compute
     event_mgr_->ThenExecute(h2d_stream_, [sync_event]() {
         musaEventDestroy(sync_event);
     });
@@ -103,19 +123,26 @@ if (sync_dst_compute) {
 musaMemcpyAsync(dst, bounce_buffer, bytes, ..., h2d_stream_);
 pool->FreeAsync(bounce_buffer, h2d_stream_);
 
-// 3. 完成通知：host 侧 event polling
+// 3. 核心修复：H2D→后续 compute
+//    不再依赖 H2D→compute 的 musaStreamWaitEvent，而是 H2D 完成后才 done。
 event_mgr_->ThenExecute(h2d_stream_, [done]() {
-    done(Status::OK());  // H2D GPU 完成后才通知 TF
+    done(Status::OK());  // H2D GPU 完成后才通知 TF 调度后续 compute
 });
 ```
 
 **关键变更**：
 | 变更 | 说明 |
 |------|------|
-| 移除 H2D→compute 的 `musaStreamWaitEvent` | GPU 侧异步等待不可靠 |
-| `sync_dst_compute` 反转为 compute→H2D | 正确语义 + 可靠方向 |
-| H2D 完成通知改为 `ThenExecute` 回调 | host 侧完成通知，不阻塞 host |
+| 移除 H2D→compute 的 `musaStreamWaitEvent` | 本次 illegal address 的主因是后续 compute 没有可靠等 H2D 完成 |
+| H2D 完成通知改为 `ThenExecute` 回调 | H2D 真完成后才 `done()`，避免 TF 过早调度依赖该输入的 compute |
+| 保留 compute→H2D 的 `sync_dst_compute` 前置保护 | 只防 dst buffer 被 allocator 复用时覆盖 previous compute，通常不是普通 feed H2D 主路径 |
 | D2H 添加 `TensorReference` | 防止异步 D2H 期间 tensor 被释放 |
+
+**需要区分的两个方向**：
+- `sync_dst_compute` 处理的是 **previous compute → H2D**：防止 H2D 覆盖上一段 compute 还在使用的复用 buffer。
+- `ThenExecute(done)` 处理的是 **H2D → next compute**：防止后续 compute 读到尚未完成的 H2D 数据。
+
+本次 `MUSA_ERROR_ILLEGAL_ADDRESS` 的核心修复是第二个方向，即 H2D 完成后才通知 TensorFlow 调度后续 compute。`sync_dst_compute` 是配套的前置安全保护，不是主要止血点。
 
 ### 1.5 最终效果
 
@@ -294,66 +321,92 @@ HostMemory("z")
 
 ### 3.4 解决方案
 
-**新增两个环境变量控制 H2D 路径选择**：
+**采用两层优化：先减少同步开销，再减少调度碎片。**
+
+#### 第一层：Adaptive H2D Routing（按大小自适应路由）
+
+核心思想：小 tensor 的主要成本不是 PCIe / DMA 带宽，而是 runtime 调用、event/wait、callback 和 TF 调度开销；大 tensor 才更依赖 H2D/compute overlap。
 
 ```cpp
-// 环境变量控制
-MUSA_PAGEABLE_H2D_ON_COMPUTE_STREAM=1  // pageable 内存 H2D 走 compute stream
-MUSA_PINNED_H2D_ON_COMPUTE_STREAM=1    // pinned 内存 H2D 走 compute stream
-```
+constexpr size_t kSmallH2DThreshold = 64 * 1024;
 
-**Pageable H2D 走 compute stream 的实现**：
-```cpp
-if (sync_dst_compute && EnablePageableH2DOnComputeStream()) {
-    // 直接在 compute stream 上做 H2D，天然有序，无需跨 stream 同步
-    musaMemcpyAsync(dst, bounce_buffer, bytes, musaMemcpyHostToDevice,
-                    stream_handle_);  // 注意：用 stream_handle_ 而非 h2d_stream_
-    pool->FreeAsync(bounce_buffer, stream_handle_);
-    done(Status::OK());
-    return;
-}
-```
-
-**Pinned H2D 走 compute stream 的实现**：
-```cpp
-if (sync_dst_compute && EnablePinnedH2DOnComputeStream()) {
+if (sync_dst_compute && bytes <= kSmallH2DThreshold) {
+    // 小 H2D 直接走 compute stream，利用同 stream FIFO 保证顺序
     musaMemcpyAsync(dst, src, bytes, musaMemcpyHostToDevice, stream_handle_);
     done(Status::OK());
     return;
 }
+
+// 大 H2D 保留独立 h2d_stream_，避免牺牲 copy/compute overlap
+musaMemcpyAsync(dst, src, bytes, musaMemcpyHostToDevice, h2d_stream_);
+event_mgr_->ThenExecute(h2d_stream_, [done]() {
+    done(Status::OK());
+});
 ```
 
-**同步逻辑重构**：
-- 将 `sync_dst_compute` 的同步逻辑封装为 `wait_h2d_stream_for_compute` lambda
-- 同样重构 D2H 路径的 `wait_d2h_stream_for_compute` lambda
-- 统一错误处理，增加细粒度的错误检查
+**收益**：
+- 小 H2D 避免每次跨 stream event/wait/callback
+- 大 H2D 仍保留独立 `h2d_stream_` 的并行能力
+- 比“所有 H2D 都放 compute stream”更精细，避免大拷贝被串行化
+
+#### 第二层：Feed Copy Group（入口 feed 批量完成通知）
+
+核心思想：同一次推理 step 开头的 feed tensor 往往集中 H2D。多个 copy 仍然提交到同一个 `h2d_stream_`，但只在队尾注册一次 group done。
+
+```cpp
+// 同一次 sess.run() / 推理 step 的 feed copy group
+for (auto& feed : feed_copies) {
+    musaMemcpyAsync(feed.dst, feed.src, feed.bytes,
+                    musaMemcpyHostToDevice, h2d_stream_);
+}
+
+// h2d_stream_ 是 FIFO；该回调触发时，前面的 feed copy 都已完成
+event_mgr_->ThenExecute(h2d_stream_, [group_done]() {
+    group_done(Status::OK());
+});
+```
+
+**关键点**：
+- 不是把多个 copy 合成一个硬件 copy，而是把多次完成通知合成一次
+- 依赖 `h2d_stream_` FIFO：队尾 callback 触发即表示前面所有 feed copy 完成
+- 只针对 step 入口的大量 feed H2D；运行中零散 H2D 仍走原来的 per-copy 路径
+
+**为什么不用全量 H2D on compute stream**：
+- 全部放 compute stream 虽然简单，但会牺牲大 H2D 与 compute 的重叠
+- 自适应路由只让小 H2D 走 compute stream，大 H2D 继续走 `h2d_stream_`
+- feed copy group 进一步把上百次 `ThenExecute(done)` 降成一次，减少 TF executor 调度碎片
 
 ### 3.5 最终效果
 
 | 维度 | 优化前 | 优化后 |
 |------|--------|--------|
-| Event/Wait 次数 | 200+ 次/推理 | **0 次**（走 compute stream） |
-| H2D 尾延迟 | 显著（event/wait 风暴） | **大幅降低** |
-| 适用场景 | 通用 | 推理场景（大量 feed tensor） |
+| 小 H2D 同步开销 | 每个 tensor 都有 event/wait/callback | 小 tensor 走 compute stream，0 次跨 stream 同步 |
+| 大 H2D 并行能力 | 独立 `h2d_stream_` | 保留独立 `h2d_stream_`，不强制串行化 |
+| Feed 完成通知 | 200+ 次/推理 | **1 次 group done** |
+| TF 调度碎片 | 每个 feed 单独 `done()` | 入口 feed 批量完成后统一调度 |
+| 适用场景 | 通用 per-copy 路径 | 推理场景：大量小 feed + 少量大输入 |
 
 **使用方式**：
 ```bash
-# 推理场景启用优化
-export MUSA_PAGEABLE_H2D_ON_COMPUTE_STREAM=1
-export MUSA_PINNED_H2D_ON_COMPUTE_STREAM=1
+# 推理场景启用自适应 H2D 路由和 feed copy group
+export MUSA_H2D_ADAPTIVE_ROUTING=1
+export MUSA_H2D_SMALL_COPY_THRESHOLD=65536
+export MUSA_FEED_H2D_COPY_GROUP=1
 ```
 
 **注意事项**：
-- 训练场景通常不需要此优化（feed tensor 较少）
-- 同 stream H2D 会阻塞 compute stream 上的后续 kernel，但对于推理场景，feed 本身就是瓶颈
-- 默认关闭，通过环境变量显式启用
+- `MUSA_H2D_SMALL_COPY_THRESHOLD` 需要根据 profiling 调整，不同模型和硬件最优值不同
+- Feed copy group 只适合 step 入口已知的一批 feed tensor，不适合运行过程中动态产生的 H2D
+- 如果 H2D 与 compute 高度可重叠，过多小 tensor 走 compute stream 可能反而降低并行度
 
 ### 3.6 测试方法
 
 **功能测试**：
 ```bash
 # 推理场景测试
-export MUSA_PAGEABLE_H2D_ON_COMPUTE_STREAM=1
+export MUSA_H2D_ADAPTIVE_ROUTING=1
+export MUSA_H2D_SMALL_COPY_THRESHOLD=65536
+export MUSA_FEED_H2D_COPY_GROUP=1
 python musa_run_pb_graph.py --spec meta_graph_2.spec --bs 32
 # 验证：结果正确，H2D 阶段耗时降低
 ```
@@ -361,10 +414,13 @@ python musa_run_pb_graph.py --spec meta_graph_2.spec --bs 32
 **性能测试**：
 ```python
 # 对比开启前后的 H2D 阶段耗时
-# 使用 MUSA_TELEMETRY 记录每个 H2D memcpy 的时间戳
+# 使用 MUSA_TELEMETRY 记录每个 H2D memcpy、callback 和 group done 的时间戳
 export MUSA_TELEMETRY_ENABLED=1
 export MUSA_TELEMETRY_LOG_PATH=/tmp/telemetry.json
-# 分析 telemetry 中 H2D 事件的总耗时和尾延迟
+# 分析 telemetry 中：
+# 1. 小 H2D 是否走 compute stream
+# 2. feed copy callback 数量是否从 N 降为 1
+# 3. H2D 阶段 P50/P99 和尾延迟是否下降
 ```
 
 ---
@@ -376,8 +432,8 @@ export MUSA_TELEMETRY_LOG_PATH=/tmp/telemetry.json
 | **现象** | GPU MMU Fault | 随机负维度崩溃 | H2D 阶段耗时长 |
 | **根因** | `musaStreamWaitEvent` 不可靠 | Shape tensor host/device 语义污染 | 大量 feed 的 event/wait 风暴 |
 | **定位方法** | 逐步二分：同步→异步→event/wait | 图分析：shape tensor 链路追踪 | Profiling：H2D 耗时分析 |
-| **关键实验** | 同 stream H2D 成功 | int32 改 host path 成功 | compute stream H2D 成功 |
-| **解决方案** | `ThenExecute` 回调 | 全链路 host-memory special path | 环境变量控制走 compute stream |
+| **关键实验** | 同 stream H2D 成功 | int32 改 host path 成功 | 小 H2D 走 compute stream + feed group 成功 |
+| **解决方案** | `ThenExecute` 回调 | 全链路 host-memory special path | Adaptive routing + Feed copy group |
 | **效果** | 不再崩溃 | 长跑稳定 | H2D 尾延迟大幅降低 |
 
 ### 面试常见问题
@@ -394,5 +450,5 @@ A: 在 TF 复杂环境下（大量并发、muDNN 算子、BFCAllocator、EventMg
 **Q: Shape tensor 为什么不能走 device path？**
 A: `Shape` 产出的是 shape 元信息（每个维度的大小），`Reshape`/`Fill` 等下游算子需要在 host 侧读取这些值来决定输出形状。如果 shape tensor 在 device 上被 muDNN 算子处理后写回，host 侧读到的可能是未同步的脏值。
 
-**Q: 推理场景的 H2D 优化为什么默认关闭？**
-A: 同 stream H2D 会阻塞 compute stream 上的后续 kernel。训练场景中 feed tensor 较少，跨 stream event/wait 的开销可以接受，且并行度更重要。推理场景 feed tensor 多，H2D 本身就是瓶颈，此时同 stream 的有序性反而更优。
+**Q: 推理场景的 H2D 优化为什么不直接全部放到 compute stream？**
+A: 全部放到 compute stream 虽然能利用同 stream FIFO 避免跨 stream 同步，但会牺牲大 H2D 与 compute 的重叠。更稳妥的做法是 adaptive routing：小 H2D 走 compute stream，减少 event/wait/callback；大 H2D 仍走独立 `h2d_stream_`，保留并行能力。对于 step 入口的大量 feed tensor，再用 feed copy group 把多次完成通知合并成一次，减少 TF executor 调度碎片。
