@@ -2530,6 +2530,471 @@ prefill 是这轮性能文档最早梳理出来的主线
 > DeepSeek V4 FP8 MUSA Serving Bring-up：Prefill / Decode 优化与 Runtime 修复。
 
 
+### 4.9.1 Decode / TPOT 深挖补充：为什么第四章不能只写提交清单
+
+第二阶段如果只列提交，会显得比 prefill 主线弱。实际上 decode / TPOT 优化有一条非常清晰的技术主线：
+
+```text
+prefill 优化 TTFT / large-M throughput
+decode 优化 TPOT / small-M latency
+```
+
+prefill 的大 token 场景可以通过 large tile、更多并行度、workspace 复用、批量写 cache 来摊薄开销；decode 则完全不同：每一步通常只有 1 个 token 或少量 token，但会反复执行上百到上千次。任何小 kernel 的 launch、dispatch、cache lookup、metadata 处理、fallback 都会被每个 generated token 放大。
+
+因此 decode 侧的优化目标不是“把 prefill kernel 缩小一点继续用”，而是要建立一套独立的 small-M fast path：
+
+```text
+1. decode attention 要有适合 page / head / prefix-tail 的 fast path。
+2. cache store 要走低延迟 decode path，而不是 prefill 高吞吐大 kernel。
+3. RoPE / norm / MHC 这类小算子要避免每 token fallback 或 materialization。
+4. prefill 如果切到 paged cache，decode 必须有对应 paged kernel 消费。
+5. sampling 是 decode 最后一环，不能在 no-seed online path 上不稳定。
+```
+
+所以第二阶段的真正目标是：
+
+> **保护 TPOT，避免 prefill 优化只改善 TTFT，却让 decode 每 token latency 被 fallback、小 kernel 调度、cache layout mismatch 或 graph capture 问题拖慢。**
+
+#### 4.9.2 Decode 不是 prefill 的缩小版
+
+decode 与 prefill 的差异可以从三个维度理解。
+
+1. **并行粒度不同**
+
+   prefill 中 `num_tokens` 很大，例如 8K / 16K / 32K token。即使单个 kernel launch 有固定开销，也可以被大量 token 摊薄。
+
+   decode 中每步通常只有：
+
+   ```text
+   num_tokens = batch_size 或少量 active tokens
+   ```
+
+   这时固定开销无法被摊薄，kernel launch、dispatch branch、metadata 小 tensor 构建都会直接进入 TPOT。
+
+2. **最优 kernel 策略不同**
+
+   prefill 喜欢：
+
+   ```text
+   large tile
+   更高并行度
+   更宽 vector write
+   tile-parallel / subwarp16 / x8
+   workspace reuse
+   ```
+
+   decode 喜欢：
+
+   ```text
+   小 shape fast path
+   低 launch overhead
+   少分支
+   少中间 tensor
+   graph replay 友好
+   decode_x4 / vec2 / queue policy
+   ```
+
+   所以一个 prefill 高吞吐 kernel，在 decode small-M 下可能因为调度成本过高而变慢。
+
+3. **fallback 的影响不同**
+
+   prefill fallback 主要表现为 TTFT 变高；decode fallback 会影响每一个生成 token：
+
+   ```text
+   每 token 多 20us
+   生成 1000 token
+   端到端就多 20ms
+   ```
+
+   高并发下还会进一步放大 TPOT tail latency。
+
+因此第二阶段必须单独保护 decode fast path。
+
+#### 4.9.3 DSV4 MUSA decode fast path 底座：cache / HC head / MHC
+
+`17be8f1bf Add MUSA DeepSeekV4 decode fast paths` 的价值在于给 decode 建立底座。它不是只加一个 kernel，而是把 DSV4 decode 中高频小路径接到 MUSA fast path 上：
+
+```text
+decode token
+  -> cache / hc_head / MHC fast path
+  -> model path dispatch
+  -> cache / MHC benchmark 验收
+```
+
+优化前可能出现的问题是：
+
+```text
+1. decode 阶段依赖通用 fallback。
+2. 某些 cache / HC head / MHC 小 shape 没有 MUSA 专用入口。
+3. trace 中看不到预期 MUSA decode kernel。
+4. prefill latency 改善了，但 TPOT 仍然偏高。
+```
+
+根因是 decode 的工作负载是 small-M，不适合直接复用 prefill 大 token kernel。cache lookup、HC head、MHC 这些路径虽然单次不一定大，但每 token 都可能调用，一旦走通用路径就会变成 TPOT 热点。
+
+定位方式通常是：
+
+```text
+1. 分开测 prefill latency 和 decode TPOT。
+2. 用 cache / MHC benchmark 单独测 decode-like shape。
+3. trace decode 阶段实际 kernel，确认是否命中 MUSA decode path。
+4. 对比 small-M 和 large-M 行为，确认是否 decode 特有问题。
+```
+
+修复后的意义是：
+
+```text
+DSV4 decode 不再只是“能跑”，而是有可 benchmark、可 trace、可继续优化的 MUSA decode fast path 底座。
+```
+
+#### 4.9.4 TileLang decode attention：queue4 / prefix-tail / page32 / head256 的意义
+
+TileLang decode attention 这一组提交看起来分散：
+
+```text
+queue4 prefix-tail
+page size 32
+head size 256
+production dispatch policy
+remove disable switch
+simplify queue4 segment policy
+```
+
+但本质都是为了让 decode attention 进入生产可用状态。
+
+decode attention 的难点不是大矩阵吞吐，而是：
+
+```text
+1. 每个 request 历史长度不同。
+2. KV cache 按 page 存放，page layout 会影响访问方式。
+3. decode 每 token 都要读历史 KV。
+4. prefix / tail segment 处理不稳定会导致 dispatch 复杂或 fallback。
+5. page_size / head_size 不支持时会直接 miss fast path。
+```
+
+其中：
+
+- `page32` 解决的是 page layout 覆盖问题。
+- `head256` 解决的是 DSV4 / MLA 相关 head dimension 覆盖问题。
+- `queue4 prefix-tail` 解决的是 decode serving 中 prefix 段与 tail 段组织方式问题。
+- `production dispatch policy` 解决的是“哪些 shape 应该走 TileLang fused decode，哪些不应该走”的生产策略问题。
+- 移除 disable switch 说明路径从实验功能走向默认生产策略。
+
+可以这样理解：
+
+```text
+没有 page32/head256：真实 serving shape 可能无法命中。
+没有 queue4/prefix-tail：变长请求和 prefix/tail 组织不稳定。
+没有 production policy：容易依赖人工开关或误入 fallback。
+```
+
+这类优化对 TPOT 的影响来自两个方面：
+
+```text
+1. 让更多 decode attention shape 命中 fused fast path。
+2. 减少 dispatch 不确定性和 fallback 造成的 tail latency。
+```
+
+验收时不能只看单个 kernel 是否能跑，还要看：
+
+```text
+page32/head256 correctness
+不同 request length 的 decode TPOT
+queue4 / prefix-tail branch trace
+graph capture / replay 是否稳定
+fallback 是否消失
+```
+
+#### 4.9.5 RoPE decode path：小算子为什么值得优化
+
+RoPE decode path 的特点是：
+
+```text
+单次开销不一定大
+但每 token 都会调用
+```
+
+如果生成长度很长，RoPE 这类小算子就会进入 TPOT 累积成本。优化重点不是像 prefill 那样追求大规模吞吐，而是：
+
+```text
+1. 小 shape 快速命中 MUSA fast path。
+2. 避免不必要 materialization。
+3. 避免 torch fallback。
+4. 保持 graph capture 友好。
+```
+
+典型问题表象包括：
+
+```text
+trace 中 RoPE / norm_rope kernel 高频出现
+某些 decode shape miss fast path
+fallback 到 torch path
+出现额外 tensor materialization 或 sync
+TPOT tail latency 偏高
+```
+
+这类优化的判断方式是：
+
+```text
+1. 单独 profile decode token loop。
+2. 看 RoPE 是否每步产生额外 kernel / fallback。
+3. 对比开启/关闭 RoPE decode fast path 的 TPOT。
+4. 验证 graph capture 下没有不兼容操作。
+```
+
+面试时可以强调：
+
+> RoPE 本身不是大算子，但 decode 是每 token 高频路径。小算子如果每步多一点 overhead，会直接乘到 TPOT 上，所以 decode RoPE 优化是 tail latency 优化，不是 large-M 吞吐优化。
+
+#### 4.9.6 cache store decode / prefill 分流：为什么不能共用一套 kernel
+
+cache store 是第二阶段里最能体现 decode / prefill 差异的点之一。
+
+prefill 与 decode 都要写 cache，但目标完全不同：
+
+```text
+prefill:
+  token 多
+  写入量大
+  追求带宽和吞吐
+  适合 tile-parallel / subwarp16 / x8 / pack store
+
+decode:
+  token 少
+  每步高频
+  追求低延迟和低调度开销
+  适合 decode_x4 / decode_vec2 / fp32 / i32addr 等轻量路径
+```
+
+如果 decode 误用 prefill 大 kernel，可能出现：
+
+```text
+1. launch / 调度开销相对过大。
+2. 并行度设计与 tiny-M 不匹配。
+3. TPOT 回退。
+```
+
+如果 prefill 误用 decode 轻量 kernel，则可能出现：
+
+```text
+1. 写带宽不足。
+2. 大 token cache store 吞吐不够。
+3. TTFT / prefill latency 变差。
+```
+
+因此 cache store 必须分流：
+
+```text
+decode small-M  -> decode_x4 / vec2 / fp32 / i32 address
+prefill large-M -> tile-parallel / subwarp16 / x8 / pack store
+```
+
+这里的关键不是某个 kernel 名字，而是 dispatch policy：
+
+```text
+根据 num_tokens / mode / dtype / address layout / page metadata
+选择 decode 低延迟路径或 prefill 高吞吐路径
+```
+
+验收时要分别测：
+
+```text
+1. decode token cache store latency / TPOT。
+2. prefill 8K/16K cache bandwidth。
+3. trace 中 decode 是否命中 decode_x4/vec2。
+4. trace 中 prefill 是否命中 x8/subwarp/tile-parallel。
+5. invalid indices / page boundary 是否正确处理。
+```
+
+这也是文档里“不能只优化 prefill”的重要证据：cache store 是同一个功能，但 decode 和 prefill 必须走两套策略。
+
+#### 4.9.7 MHC decode split correctness：decode fast path 首先要正确
+
+`b64efe165 Fix MHC pre big fuse decode split correctness` 说明 decode 优化不只是性能，还包括 correctness guard。
+
+MHC pre big fuse 的 split / hidden_block / pass_config 对 `num_tokens` 很敏感：
+
+```text
+prefill / mid-prefill:
+  num_tokens 较大
+  可以使用更激进的 hidden_block / split / fuse 策略
+
+decode / tiny-decode:
+  num_tokens 很小
+  需要更保守的小 shape 配置
+```
+
+如果 decode 复用 prefill-oriented split，可能不是“慢一点”，而是：
+
+```text
+结果不一致
+某些 split 下 correctness benchmark 失败
+small-M shape 输出错误
+```
+
+定位方法是：
+
+```text
+1. 对比 num_tokens <= 32 / 64 与大 token 输出。
+2. 对比不同 n_splits / hidden_block 配置。
+3. 用 unfused baseline 验证数值。
+4. 确认问题是否只在 decode-like shape 出现。
+```
+
+修复方式是根据 decode-like token 数选择更合适的：
+
+```text
+threads
+hidden_block
+pass_config
+split kernel
+```
+
+这一节可以总结为：
+
+> **decode fast path 的第一要求是正确。只有 small-M split 策略正确，后续 TPOT 优化才有意义。**
+
+#### 4.9.8 paged decode kernel：和 `is_paged=True` 的 serving 闭环
+
+`eb255ea13` 要和前面的 `81fc824a2` 串起来理解。
+
+`81fc824a2` 中 prefill compress / cache path 启用了：
+
+```python
+is_paged=True
+```
+
+这意味着 prefill 写入的是 paged metadata / paged cache layout。serving 是一个闭环：
+
+```text
+prefill 写 cache
+decode 读 cache / 更新 cache
+```
+
+如果只改 prefill，不补 decode paged kernel，就会出现：
+
+```text
+prefill 写入 paged layout
+decode 仍按 non-paged 或旧 layout 消费
+=> block/page index 不一致
+=> cache 读错 / 写错
+=> fallback 或 correctness mismatch
+```
+
+因此 decode 必须补对应 paged kernel。这个提交的意义不是单独提速，而是保证：
+
+```text
+prefill 写什么 layout，decode 就按同样 layout 读。
+```
+
+这也是 runtime hardening 的一种形式：不是只让局部 kernel 能跑，而是让 serving path 闭环一致。
+
+验收重点包括：
+
+```text
+1. prefill is_paged=True 后 decode 连续生成正确。
+2. paged / non-paged dispatch 不混淆。
+3. cache read/write block_id / page index 对齐。
+4. trace 中 decode 不 fallback 到旧 path。
+5. E2E serving 长上下文无 cache layout mismatch。
+```
+
+#### 4.9.9 sampling：decode runtime 的最后一环
+
+sampling 修复已经在 3.4 展开，但放到第二阶段里，它是 decode runtime 的最后一步：
+
+```text
+logits
+  -> probability
+  -> top-k / top-p / min-p
+  -> sampling
+  -> next token
+```
+
+如果前面的 decode attention / cache / RoPE / MHC 都正确，但最后一步 sampling 不稳定，用户看到的仍然是生成异常：
+
+```text
+空输出
+提前 EOS
+重复特殊 token
+batch 内个别 row 异常
+pressure test 下 no-seed 生成不稳定
+```
+
+因此 MUSA no-seed sampling 改用 `sgl_kernel`，本质上也是 decode / TPOT 阶段的一部分。它解决的不是 prefill 性能，而是 online decode serving 稳定性。
+
+#### 4.9.10 Decode / TPOT 验收方法
+
+第二阶段的验收不能只跑 prefill benchmark。建议分成五层：
+
+1. **E2E TPOT**
+
+   验证：
+
+   ```text
+   不同 batch size
+   不同输出长度
+   不同 prompt length
+   graph replay 前后
+   ````
+
+   的 TPOT 是否下降或至少不回退。
+
+2. **kernel trace / dispatch correctness**
+
+   验证 trace 中是否命中：
+
+   ```text
+   DSV4 MUSA decode cache / HC head / MHC path
+   TileLang decode attention
+   RoPE decode fast path
+   decode_x4 / decode_vec2 cache store
+   paged decode kernel
+   sgl_kernel sampling
+   ```
+
+   同时确认没有意外 torch fallback / generic fallback。
+
+3. **operator benchmark**
+
+   分别跑：
+
+   ```text
+   cache decode benchmark
+   MHC decode benchmark
+   decode attention page32/head256 test
+   RoPE small-M benchmark
+   paged decode correctness test
+   ```
+
+4. **graph capture / replay**
+
+   验证：
+
+   ```text
+   capture 阶段无 torch fallback
+   replay 路径稳定
+   无动态分配 / unexpected sync
+   decode latency jitter 降低
+   ```
+
+5. **serving correctness**
+
+   验证：
+
+   ```text
+   paged prefill + paged decode 连续生成正确
+   CP / TP 配置下输出稳定
+   no-seed sampling 无异常 token
+   seeded sampling 仍可复现
+   greedy 不受影响
+   ```
+
+#### 4.9.11 Decode 阶段面试总回答模板
+
+> 第二阶段是 decode / TPOT 路径优化与保护。prefill 优化的是 large-M 吞吐和 TTFT，而 decode 是 small-M、每 token 高频调用，核心指标是 TPOT，所以不能直接复用 prefill 大 kernel。我们补齐了 DSV4 MUSA decode fast path，包括 cache、HC head、MHC 等小 shape 高频路径；同时生产化 TileLang decode attention，支持 queue4 prefix-tail、page32、head256 和明确 dispatch policy，减少 fallback 和手动开关依赖。RoPE decode 侧优化小 shape fast path，避免每 token materialization 或 fallback。cache store 则做 decode/prefill 分流：decode 走 x4/vec2 等低延迟路径，prefill 走 x8/subwarp/tile-parallel 高吞吐路径。此外，MHC decode split 修复保证 small-M correctness；当前面 prefill 启用 `is_paged=True` 后，又补齐 paged decode kernel，保证 prefill 写入的 paged cache 能被 decode 正确消费。最后 sampling 修复属于 decode runtime 的最后一环，MUSA no-seed 下改用 `sgl_kernel` 避免 `torch.multinomial` 不稳定。整体目标是保护 TPOT，避免 prefill 优化只改善 TTFT，却让 decode latency 因 fallback、小 kernel 调度或 layout mismatch 回退。
+
+
 ### 4.10 面试版逐项解析：decode / TPOT 优化类
 
 #### 4.10.1 DSV4 MUSA decode fast paths
