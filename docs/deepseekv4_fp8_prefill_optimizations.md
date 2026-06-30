@@ -5696,6 +5696,114 @@ decode 验收重点不是 large-M throughput，而是 TPOT、small-M latency、d
 - **已固化在代码里的 acceptance budget**：可以直接引用。
 - **运行 benchmark 后得到的实测性能**：代码支持输出，但仓库中未固化具体数值，需要在 MUSA 环境上实际执行。
 
+### 8.2.1 8K input / 1K output 场景下的端到端吞吐判断
+
+> 说明：本小节用于记录一次基于 TTFT / TPOT 的端到端吞吐换算口径。这里的 throughput 指单请求或固定请求形态下的：
+>
+> ```text
+> total throughput = (input_tokens + output_tokens) / end_to_end_time
+> ```
+>
+> 它不是高并发 serving aggregate throughput；如果用于简历或报告，需要同时注明机器、模型、batch/concurrency、TP/CP 配置。
+
+假设场景为：
+
+```text
+input tokens  = 8K
+output tokens = 1K
+原始 TTFT     = 679 ms
+优化后 TTFT   = 373 ms
+原始 TPOT     = 7.3 ms/token
+优化后 TPOT   = 6.6 ms/token
+```
+
+端到端总时间按如下方式估算：
+
+```text
+total_time = TTFT + (output_tokens - 1) * TPOT
+```
+
+如果按 `8K = 8000`、`1K = 1000` 近似：
+
+```text
+原始 total_time = 679 ms + 999 * 7.3 ms
+                = 7971.7 ms
+                = 7.9717 s
+
+优化后 total_time = 373 ms + 999 * 6.6 ms
+                  = 6966.4 ms
+                  = 6.9664 s
+```
+
+因此按 input + output tokens 计算的 total throughput 为：
+
+```text
+原始 throughput = 9000 / 7.9717 ≈ 1129 tokens/s
+优化后 throughput = 9000 / 6.9664 ≈ 1292 tokens/s
+```
+
+提升比例：
+
+```text
+1292 / 1129 - 1 ≈ 14.4%
+```
+
+如果严格按 `8K = 8192`、`1K = 1024` 计算：
+
+```text
+原始 total_time = 679 ms + 1023 * 7.3 ms
+                = 8146.9 ms
+                = 8.1469 s
+
+优化后 total_time = 373 ms + 1023 * 6.6 ms
+                  = 7124.8 ms
+                  = 7.1248 s
+
+原始 throughput  = 9216 / 8.1469 ≈ 1131 tokens/s
+优化后 throughput = 9216 / 7.1248 ≈ 1294 tokens/s
+提升比例          ≈ 14.4%
+```
+
+因此，两种 8K / 1K 口径下结论基本一致：
+
+| 指标 | 原始 | 优化后 | 变化 |
+| --- | ---: | ---: | ---: |
+| TTFT | 679 ms | 373 ms | -45.1% |
+| TPOT | 7.3 ms/token | 6.6 ms/token | -9.6% |
+| end-to-end time，8000+1000 口径 | 7.9717 s | 6.9664 s | -12.6% |
+| total throughput，8000+1000 口径 | 1129 tokens/s | 1292 tokens/s | +14.4% |
+| total throughput，8192+1024 口径 | 1131 tokens/s | 1294 tokens/s | +14.4% |
+
+这个结果是合理的，原因是 8K input / 1K output 场景中 decode 时间占比较高。虽然 TTFT 从 679ms 降到 373ms，下降幅度达到 45.1%，但原始总时间里 TTFT 只占：
+
+```text
+679 / 7971.7 ≈ 8.5%
+```
+
+而 decode 部分占约 91.5%。TPOT 只从 7.3ms 降到 6.6ms，单 token 只减少 0.7ms，但输出 999 个后续 token 时累计节省：
+
+```text
+999 * 0.7 ms = 699.3 ms
+```
+
+TTFT 节省为：
+
+```text
+679 ms - 373 ms = 306 ms
+```
+
+总节省约：
+
+```text
+306 ms + 699.3 ms = 1005.3 ms
+```
+
+所以在这个场景下，端到端吞吐提升约 14.4% 是自洽的：prefill 优化显著降低 TTFT，decode TPOT 的小幅下降则因为 1K 输出长度被累积放大。
+
+如果用于简历，可以写成：
+
+> 在 `[机器配置，例如单机 8×S5000 80GB MUSA GPU]`、`[模型，例如 DeepSeek V4 Flash FP8]`、8K input / 1K output 固定请求场景下，TTFT 从 679ms 降至 373ms（-45.1%），TPOT 从 7.3ms/token 降至 6.6ms/token（-9.6%），按 input+output tokens 计算的单请求端到端 total throughput 从约 1129 tokens/s 提升至约 1292 tokens/s（+14.4%）。
+
 ### 8.3 Operator acceptance benchmark
 
 文件：
