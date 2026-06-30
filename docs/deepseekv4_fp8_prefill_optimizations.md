@@ -429,7 +429,211 @@ batch_next_token_ids = batch_next_token_ids.view(-1).to(torch.int32)
 
 保证输出 dtype 和 shape 与原 sampler path 一致。
 
-#### 3.4.6 为什么 seeded sampling 不切换？
+#### 3.4.6 `sgl_kernel` sampling 底层实现补充
+
+这里的 `sgl_kernel` sampling 不是 Python 里手写的采样逻辑，也不是 Triton / TileLang kernel。它整体是：
+
+```text
+Python wrapper
+  -> torch.ops.sgl_kernel custom op
+    -> C++ extension 注册
+      -> CUDA / MUSA 自定义设备 kernel
+```
+
+MUSA 侧 Python 封装主要在：
+
+```text
+sgl-kernel/python/sgl_kernel/musa.py
+```
+
+其中：
+
+```python
+top_p_sampling_from_probs(...)
+top_k_top_p_sampling_from_probs(...)
+min_p_sampling_from_probs(...)
+```
+
+会分别调用：
+
+```python
+torch.ops.sgl_kernel.top_p_sampling_from_probs.default(...)
+torch.ops.sgl_kernel.musa_top_k_top_p_sampling_from_probs.default(...)
+torch.ops.sgl_kernel.min_p_sampling_from_probs.default(...)
+```
+
+MUSA custom op 注册在：
+
+```text
+sgl-kernel/csrc/common_extension_musa.cc
+```
+
+其中 `top_k_top_p_sampling_from_probs` 的 MUSA 专门 kernel 在：
+
+```text
+sgl-kernel/csrc/musa/top_k_top_p_sampling.mu
+```
+
+`.mu` 是 MUSA 设备侧 kernel 文件，可以类比 CUDA 的 `.cu`。所以这条路径本质是 **SGLang 自定义 sampling op + MUSA 设备 kernel**，不是 `torch.multinomial`。
+
+##### 三个 sampling path 分别做什么？
+
+1. `top_p_sampling_from_probs(probs, top_p)`
+
+   做 top-p / nucleus sampling：
+
+   ```text
+   按概率从大到小累计
+   保留累计概率达到 top_p 的候选 token
+   在候选 token 中重新归一化并采样
+   ```
+
+   当：
+
+   ```python
+   top_p = 1.0
+   ```
+
+   时，基本等价于不做 top-p 截断，直接从完整 `probs` 分布中采样。因此 simple sampling 中：
+
+   ```python
+   top_p_sampling_from_probs(probs.contiguous(), 1.0)
+   ```
+
+   语义上是在替代：
+
+   ```python
+   torch.multinomial(probs, num_samples=1)
+   ```
+
+   也就是不改变采样策略，只替换底层采样实现。
+
+2. `top_k_top_p_sampling_from_probs(probs, top_k, top_p)`
+
+   做 top-k + top-p 组合采样：
+
+   ```text
+   top-k：只允许概率最高的 k 个 token 参与采样
+   top-p：只允许 nucleus 累计概率范围内的 token 参与采样
+   最终从同时满足 top-k / top-p 约束的 token 中采样
+   ```
+
+   MUSA no-seed complex sampling 中使用：
+
+   ```python
+   top_k_top_p_sampling_from_probs(
+       probs.contiguous(),
+       sampling_info.top_ks,
+       top_ps,
+       filter_apply_order="joint",
+   )
+   ```
+
+   `joint` 路径会走 MUSA fused kernel：
+
+   ```python
+   torch.ops.sgl_kernel.musa_top_k_top_p_sampling_from_probs.default(...)
+   ```
+
+3. `min_p_sampling_from_probs(probs, min_p)`
+
+   做 min-p sampling。min-p 不是看累计概率，而是看相对最大概率：
+
+   ```text
+   threshold = min_p * max_prob
+   保留 prob >= threshold 的 token
+   丢掉相对最大概率太小的尾部 token
+   再采样
+   ```
+
+   如果 min-p 和 top-k / top-p 同时启用，代码会先做：
+
+   ```python
+   probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+   probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+   ```
+
+   然后再调用：
+
+   ```python
+   min_p_sampling_from_probs(probs, sampling_info.min_ps)
+   ```
+
+   也就是先应用 top-k / top-p 过滤并重新归一化，再执行 min-p sampling。
+
+##### `top_k_top_p_sampling_from_probs` kernel 内部大致怎么做？
+
+直觉上，如果 top-k / top-p sampling 先完整排序 vocab，再构造 mask、renorm、multinomial，在 32K / 128K vocab 下会很重。因此 MUSA `top_k_top_p_sampling` 不是朴素完整排序实现。
+
+它的核心思路是 **fused sampling + block-level scan/reduce**：
+
+```text
+每个 batch row 一个 block
+block 内线程并行扫描这一行 vocab 概率
+用 MUSA Philox / murand 生成随机数 u
+用 block reduce / block scan 在候选概率上做 CDF sampling
+先采出一个 candidate token
+再检查 candidate 是否满足 top-k / top-p 约束
+如果不满足，提高概率阈值并重试
+满足后输出 sampled_id
+```
+
+具体来说，kernel 里会对当前行概率做并行扫描。采到 candidate token 后，设它的概率为：
+
+```text
+pivot = probs[sampled_id]
+```
+
+然后统计两件事：
+
+```text
+count = 有多少 token 的概率 > pivot
+value = 这些概率更大的 token 的概率和
+```
+
+这两个量分别用于判断 top-k 和 top-p：
+
+```text
+count < top_k 说明 candidate 位于 top-k 范围内
+value < top_p 说明 candidate 位于 top-p nucleus 范围内
+```
+
+因此接受条件可以理解成：
+
+```text
+candidate 同时满足 top-k 和 top-p 约束
+```
+
+如果 candidate 不满足条件，kernel 会提高概率阈值 `low`，下一轮只从更高概率 token 集合中采样，而不是完整排序整个 vocab。
+
+这种实现的性能取舍是：
+
+```text
+优点：
+1. 不做完整 sort，避免 O(vocab log vocab) 排序。
+2. 不显式 materialize top-k / top-p mask。
+3. top-k / top-p 判断和 sampling 融合在一个设备 kernel 中。
+4. 减少中间 tensor 写回和 kernel launch。
+
+代价：
+1. 仍然需要扫描 vocab，复杂度近似 O(vocab * retry 次数)。
+2. vocab 很大时 sampling 仍然可能是可见开销。
+3. top_k 很小或 top_p 很窄时，candidate 被拒绝并重试的概率可能上升。
+```
+
+所以这不是“零成本”的采样优化，而是一个服务化场景下合理的工程折中：
+
+```text
+绕开 MUSA torch.multinomial no-seed 不稳定路径
+避免最差的完整 sort/top-k/top-p 实现
+用 fused scan/reduce kernel 减少中间开销
+```
+
+面试时可以这样表达：
+
+> `sgl_kernel` 的 top-k/top-p sampling 不是先 sort 完整 vocab 的朴素实现。MUSA 侧有 fused `.mu` kernel，每个 batch row 一个 block，block 内通过 reduce / scan 对概率分布做 CDF sampling。采到 candidate 后统计比它概率更大的 token 数量和概率和，分别判断它是否落在 top-k 和 top-p 范围内；如果不满足就提高概率阈值继续采样。这样避免完整排序和中间 mask/renorm tensor，虽然仍然需要扫描 vocab，但比朴素 top-k/top-p + multinomial 更适合 serving，同时绕开了 MUSA no-seed `torch.multinomial` 的不稳定问题。
+
+#### 3.4.7 为什么 seeded sampling 不切换？
 
 这里保留了一个重要设计：
 
