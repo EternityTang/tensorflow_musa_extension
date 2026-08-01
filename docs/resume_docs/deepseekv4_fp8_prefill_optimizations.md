@@ -3505,3 +3505,112 @@ Fail-Closed、MCCL、JIT、forwarding
 如果面试官要求拆分团队贡献，使用以下回答：
 
 > 这份材料描述的是团队完成的整体技术链。我们可以按实际模块和记录进一步说明分工，但不会把官方能力或其他成员提交归为单个人成果。
+
+## 18. 把技术工作整理成有含金量的实习产出
+
+> **本章用途**：第 1～16 章是技术证据，第 17 章是面试表达。本章解决另一个问题——**如何把这些工作组织成一个“有含金量的实习产出”**：即让人一眼看出这不是打杂、跑通 demo 或改配置，而是产生了真实、可复用、可验证、体现工程判断的交付物。含金量不取决于“算法是不是你发明的”，而取决于**产出物的质量、覆盖的难度、以及是否沉淀成可复用的能力**。
+
+### 18.1 “有含金量的实习产出”的判断标准
+
+招聘方/导师判断一个实习产出是否有分量，看的不是工时，而是四条：
+
+```text
+1. 真实交付物：有没有进生产/被复用的 kernel、pipeline、工具、方法，而不是一次性脚本
+2. 难度稀缺性：这件事是不是“别人不容易做”——跨架构、底层 kernel、系统闭环都算
+3. 可验证性：产出是否有 benchmark/正确性/回归支撑，而不是“我觉得变快了”
+4. 可复用/方法沉淀：是不是留下了能规模化的规则、流程、回归集，而不是走了就没了
+```
+
+把前面章节的工作对到这四条上，会发现它**全都命中**——问题只是之前没按“产出物”视角组织，而是按“提交/优化点”视角罗列。本章就是做这个视角转换。
+
+### 18.2 从“优化点”到“交付物”：产出清单（Deliverables Inventory）
+
+面试/答辩不要说“我做了 MoE、quant、sparse……”（这是任务列表），要说“我交付了以下东西”（这是产出）。把散在各章的工作重组为可清点的交付物：
+
+| # | 交付物 | 对应章节 | 交付物类型 | 含金量点 |
+|---|---|---|---|---|
+| D1 | 一套 MUSA/S5000 专用算子 kernel（FP8 quant、cache store、compress、norm-rope、TopK、MoE compact scatter） | 3/4/5/7 | 手写 kernel | 上游 CUDA kernel 无法运行，必须重写；有 half-warp/parallel-reduce/宽写等微架构级设计 |
+| D2 | MoE Prefill 的 S5000 Fixed-Bucket Compact Pipeline | 3 | 数据组织/pipeline 重构 | 在官方 grouped GEMM 前后重建数据流，含容量/overflow 契约 |
+| D3 | FlashMLA Sparse Prefill 的 MUSA 落地 + CP 修复 | 6 | 移植+正确性修复 | workspace gather/dequant 的 MUSA 实现 + CP round-robin metadata 修复 |
+| D4 | Decode Small-M 路径（Queue4/Page32/Head256/Split-K/paged 闭环） | 8 | 平台扩展+kernel | 保护 TPOT，prefill kernel 不能直接复用 |
+| D5 | MUSA Runtime 硬化（fail-closed、MCCL 绑定、JIT key、forwarding、graph-safe） | 10 | 系统闭环 | 上游 NVIDIA 不存在的问题，从 0 到 1 |
+| D6 | Online C128 / PP / PD / HiSparse 的 MUSA 状态闭环 | 9 | 系统适配 | 多坐标系、deferred-commit 状态机、跨层 transfer 可见性 |
+| D7 | 一套上游→MUSA 适配方法论（三基线 + Roofline 归因 + 四类决策 + 分层验证） | 11 | 方法/流程 | 可复用到任意新特性，是规模化能力 |
+| D8 | Operator/MoE/Cache/Sparse 的 benchmark 与回归框架 | 3.8/5/8/12 | 测试基建 | 让性能可验收、防回归，是工程成熟度信号 |
+| D9 | 归属分级(O/P/T/R/S) + 证据分级(A/B/C/D) 的技术审计文档 | 全文 | 文档/规范 | 能清晰界定“官方 vs 平台工作”，本身是资深工程习惯 |
+
+**关键**：D7、D8、D9 常被忽略，但它们恰恰是把“实习生”和“会写代码的人”区分开的东西——**方法论、测试基建、审计规范**证明你不是只完成任务，而是建立了可复用的工程能力。
+
+### 18.3 这个实习产出体现的核心能力矩阵
+
+把交付物翻译成招聘方关心的能力标签：
+
+| 能力 | 由哪些交付物证明 | 为什么值钱 |
+|---|---|---|
+| **底层 GPU kernel 工程** | D1、D2、D4 | half-warp/shfl/宽写/parallel reduce/split-K，硬功夫 |
+| **性能分析与归因** | D7、D8 | Roofline 分 memory/compute/launch-bound，不是瞎调 |
+| **跨架构移植** | D1、D3、D6 | CUDA→MUSA，ISA 级重写，稀缺经验 |
+| **硬件感知优化** | D2、D5 | 按 S5000 高脊点/带宽饥饿反向优化 |
+| **系统/分布式工程** | D5、D6 | graph capture、多卡、PP/PD、状态机 |
+| **工程方法与规范** | D7、D8、D9 | 方法论、回归、归属审计——可规模化、可维护 |
+
+一份实习产出能同时覆盖“kernel + 性能 + 系统 + 方法”四个层面，本身就说明它含金量不低。
+
+### 18.4 诚实的量化：即使没有实测倍数，也能量化“产出规模”
+
+“有含金量”不等于“必须有性能倍数”。在没有证据 A 实测数字时，用**结构性/规模性量化**同样有力，而且不会被问穿：
+
+```text
+覆盖算子：为 N 类 DSV4 热点算子（quant/cache/compress/norm-rope/topk/MoE/sparse）提供 MUSA 实现
+kernel 数：手写/重写 M 个 MUSA kernel（含 half-warp、split-K、双路径 dispatch）
+场景覆盖：覆盖 8K/32K/128K prefill、decode small-M、CP/PP/PD、MTP 等场景
+系统闭环：打通 K 项 MUSA 特有 runtime/多卡/graph 问题（上游不存在）
+可验证性：建立 operator/module/service 三层 benchmark + 回归 case
+方法沉淀：形成 O/P/T/R/S 归属 + A/B/C/D 证据 + 四类决策的适配规范
+```
+
+这些数字来自代码事实，**不依赖实测日志就成立**，属于证据 C，可以放心写。真正的性能倍数(1.6x/1.8x/+8%)按证据 B 单独标注“用户/项目口径、配置待补”。
+
+### 18.5 一句话实习成果定位
+
+用于简历标题栏或开场：
+
+> 在摩尔线程 S5000 上完成 DeepSeek V4 FP8 推理栈的后端落地与性能优化：手写一整套 MUSA 专用算子 kernel，重构 MoE/Sparse 数据流水线，打通 graph/多卡/PP-PD 系统闭环，并沉淀出一套“上游特性→MUSA 适配”的可复用方法论与三层 benchmark/回归体系。
+
+它同时传达：**真实交付物(kernel/pipeline) + 难度(跨架构/系统) + 可复用(方法论/回归)**，正好命中 18.1 的四条标准。
+
+### 18.6 简历里怎么写这段实习经历（bullet 范式）
+
+每条 bullet 的公式：**动词(产出物) + 难点/规模 + 可验证性/影响**，避免“参与/协助/负责”这类模糊词。
+
+- 在 MUSA(S5000) 上**手写/重写了 N 类 DSV4 FP8 热点算子 kernel**（FP8 quant、cache store、compress、TopK、MoE compact scatter），采用 half-warp 映射、parallel reduce、宽写等按硬件微架构设计的实现，因上游 CUDA kernel 无法在 MUSA 执行。
+- **重构了 MoE Prefill 的 S5000 数据流水线**：在官方 grouped GEMM 前后引入 fixed-bucket compact + quant/scatter 融合与容量/overflow 契约，减少中间落盘，并用 token 阈值隔离 decode。
+- **打通了 MUSA 后端从 0 到 1 的系统闭环**：fail-closed dispatch、MCCL 设备绑定、JIT specialization key、graph-safe fallback、PP/PD 与 Online C128 状态生命周期——均为上游 NVIDIA 版本不存在的问题。
+- **建立了一套上游→MUSA 适配方法论与三层验证体系**：三组基线 + Roofline 瓶颈归因 + 四类决策 + operator/module/service benchmark 与回归 case，可复用到后续任意上游新特性。
+- （有数据时）项目口径下 MoE 算子约 1.6×、端到端 prefill 约 +8%、TPOT −9.6%（用户/项目口径，配置/复现待补）。
+
+### 18.7 转正/答辩视角：为什么这是“能独立干活”的证据
+
+导师/评委真正想确认的是：**离开手把手指导，你能不能独立产出。** 用这条链证明：
+
+```text
+能读懂上游前沿实现（DeepGEMM/FlashMLA/MTP 调用链）
+  -> 能判断它在新硬件上哪里不成立（Roofline + 三基线归因）
+  -> 能自己写出 MUSA kernel 解决（不是等人给方案）
+  -> 能保证正确性和可验收（benchmark/回归/归属审计）
+  -> 能把经验沉淀成规则供后续复用（方法论）
+```
+
+这条链每一环都是“独立工程能力”的证据，比“完成了导师安排的 N 个任务”强得多。答辩时按这条链讲，而不是按提交时间罗列。
+
+### 18.8 避免把实习产出讲成“打杂”的三个陷阱
+
+| 陷阱 | 会被听成 | 改成 |
+|---|---|---|
+| 按提交/任务罗列（“我做了 A、B、C……”） | 打杂、执行 | 按交付物 + 能力组织（D1~D9） |
+| 只强调“移植/适配/基于官方” | 搬运工 | 承认上游后，重心放在“MUSA 上重写 + 反向优化 + 系统闭环” |
+| 没有可验证性（“应该变快了”） | 不严谨 | 挂上 benchmark/回归/证据等级，即使是结构性量化 |
+
+### 18.9 一句话收尾
+
+> 这段实习的产出不是“帮忙优化了几个算子”，而是**独立交付了一整套 MUSA/S5000 上 DeepSeek V4 FP8 推理的执行层**——从手写 kernel、重构数据流水线、打通系统闭环，到建立可复用的适配方法论和验证体系。含金量在于它同时覆盖了 kernel、性能、系统和方法四个层面，且每一层都有可验证的交付物，而不是一次性的调通。
