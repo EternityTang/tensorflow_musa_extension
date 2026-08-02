@@ -12,7 +12,73 @@
 4. [ApplyAdagrad 优化 (cf9b487)](#4-applyadagrad-优化)
 5. [优化模式总结](#5-优化模式总结)
 
----
+-```text
+                          开始：某个算子慢
+                                  │
+                                  ▼
+                 ① 看 Duration / GPU Time
+                 含义：这个 kernel 执行花了多久
+                 作用：先判断它是不是热点，值不值得优化
+                                  │
+                ┌─────────────────┴─────────────────┐
+                │                                   │
+                ▼                                   ▼
+       不是热点，占比低                       是热点，占比高
+       现象：总耗时占比很小                  现象：Top Kernel / 占比较高
+       含义：优化收益有限                    含义：值得继续分析
+                │                                   │
+                ▼                                   ▼
+            暂不优化               ② 看 AI + DRAM Throughput + SM Util
+                                    AI：每搬 1 Byte 数据做多少计算
+                                    DRAM：显存带宽用了多少
+                                    SM Util：GPU 计算核心忙不忙
+                                                    │
+                                                    ▼
+                          ┌─────────────────────────┴─────────────────────────┐
+                          │                                                   │
+                          ▼                                                   ▼
+                    Memory Bound                                      Compute Bound
+          现象：AI低，DRAM较高，SM不高                         现象：AI高，SM高，DRAM不高
+          含义：主要时间花在搬数据                             含义：主要时间花在计算
+          原因：计算少，访存多                                 原因：计算量大，算力成为瓶颈
+                          │                                                   │
+                          ▼                                                   ▼
+                 ③A 看访存类指标                                  ③B 看计算类指标
+                          │                                                   │
+        ┌─────────────────┼─────────────────┐                 ┌──────────────┼──────────────┐
+        │                 │                 │                 │              │              │
+        ▼                 ▼                 ▼                 ▼              ▼              ▼
+ DRAM Bytes大      Memory Stall高      SM Util低       TensorCore低     Occupancy低    Barrier高
+
+ DRAM Bytes：      Memory Stall：      SM Util：       TensorCore：     Occupancy：    Barrier：
+ 实际读写显存量    warp等内存的比例    SM忙碌程度      TensorCore使用率 SM上活跃warp数 同步等待比例
+
+        │                 │                 │                 │              │              │
+        ▼                 ▼                 ▼                 ▼              ▼              ▼
+中间Tensor反复读写   等数据回来       并行度/活跃warp少   没走TC或不对齐   资源占用太多   同步太多
+
+原因：              原因：             原因：              原因：           原因：          原因：
+每个小kernel都      DRAM访问慢         kernel太小          dtype不对        register太多   __syncthreads
+读写full tensor     cache命中低        block/grid不合理    layout不对       shared memory  太多
+中间结果落显存      访存不连续         occupancy不足       shape没对齐      占用太多       reduce同步多
+
+        │                 │                 │                 │              │              │
+        ▼                 ▼                 ▼                 ▼              ▼              ▼
+ 算子融合           减少访存          调block/grid        改dtype/layout   减寄存器       减同步
+ 减少store          vectorize         提高occupancy       调tile/padding   拆fusion       warp reduce
+ cache reuse        cache reuse       合并小kernel        用库kernel       调tile         优化shared memory
+
+        │                 │                 │                 │              │              │
+        └─────────────────┴─────────────────┴─────────────────┴──────────────┴──────────────┘
+                                                    │
+                                                    ▼
+                                      ④ 正确性 + 性能验证
+                                      正确性：融合/优化前后输出一致
+                                      性能：latency、traffic、stall是否下降
+                                                    │
+                                                    ▼
+                           latency下降、traffic下降、stall下降则优化有效
+```
 
 ## 1. InTopKV2 优化
 

@@ -1002,6 +1002,7 @@ Norm/RoPE/Cache 分成多个 Kernel
 MHC Prefill Split 误用于 Decode/Mixed Batch
 ```
 
+
 在 S5000 上，大 Prefill 的总 Bytes 和 Decode 的固定 Launch 成本分别成为瓶颈，不能用单一 Kernel 解决。
 
 ### 7.3 适配决策总览

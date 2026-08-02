@@ -60,7 +60,72 @@ Transpose ───────────────────────�
 4. **Step 3**: Reshape_1 的两个输入中，一个是 `Pack`（属于前缀），另一个是数据输入（可能是 `Transpose` 或外部节点）
 5. **Step 4**: Pack 的两个输入都是 `Prod`，每个 Prod 的输入是 `GatherV2`，两个 GatherV2 共享同一个 `Shape_1`
 6. **Step 5**: ConcatV2 至少包含一个 GatherV2 的输出，其余为 Const，axis 也是 Const
+路一的匹配规则从 Reshape_2 开始，自底向上逐层验证：
 
+  入口：找到一个 Reshape 节点，节点名包含 "/Tensordot"
+  │
+  ▼
+  Step 1: Reshape_2 有两个输入？
+  ├── input[0] → 必须是 MatMul（属于 Tensordot 前缀）
+  └── input[1] → 必须是 ConcatV2（属于 Tensordot 前缀）
+  │
+  ▼
+  Step 2: MatMul 有两个输入？
+  ├── input[0] → 必须是 Reshape_1（属于前缀）
+  └── input[1] → 权重节点（四选一）
+      ├── Const ────────────┐
+      ├── ReadVariableOp ───┤
+      ├── Identity ─────────┤ 任一即可
+      └── Reshape ──────────┘
+  │
+  ▼
+  Step 3: Reshape_1 有两个输入？
+  ├── input[0 或 1] → 必须是 Pack（属于前缀）
+  └── 另一个 input → 数据输入（两种可能）
+      ├── Transpose（属于前缀）→ 记录为内部转置，原始输入 = Transpose 的输入
+      └── 不属于前缀 → 记录为外部输入（Transpose 已被优化掉）
+  │
+  ▼
+  Step 4: Pack 有两个输入？
+  ├── input[0] → 必须是 Prod_1（属于前缀）
+  │   └── Prod_1 有两个输入？
+  │       ├── input[0] → GatherV2_1（属于前缀）
+  │       │   └── input[0] → 必须是 Shape_1（属于前缀）← 共享
+  │       │   └── input[1] → indices（必须是 Const）
+  │       └── input[1] → reduction_indices（必须是 Const）
+  │
+  └── input[1] → 必须是 Prod_2（属于前缀）
+      └── Prod_2 有两个输入？
+          ├── input[0] → GatherV2_2（属于前缀）
+          │   └── input[0] → 必须是 Shape_1（属于前缀）← 和 GatherV2_1 共享
+          │   └── input[1] → indices（必须是 Const）
+          └── input[1] → reduction_indices（必须是 Const）
+  │
+  ▼
+  Step 5: ConcatV2 至少 3 个输入？
+  ├── 最后一个 input → axis（必须是 Const）
+  ├── 其中一个 data input → 通过 Identity 链追溯到 GatherV2_1
+  └── 其余 data input → 必须全是 Const
+  │
+  ▼
+  全部通过 → 提取参数：
+  ├── axes_a ← GatherV2_2 的 indices 常量（收缩轴）
+  ├── axes_b ← 硬编码 [0]
+  ├── input_a ← 数据输入（Transpose 的输入 或 外部输入）
+  └── input_b ← 权重节点
+  │
+  ▼
+  变换：
+  ├── 删除前缀下所有节点（保留外部输入和被其他消费者引用的共享节点）
+  └── 创建 MusaTensorDot(input_a, input_b, axes_a, axes_b)
+  │
+  ▼
+  下游分叉：
+  ├── 无 BiasAdd → 结束，输出 MusaTensorDot
+  └── 有 BiasAdd → 下一轮迭代匹配 MusaTensorDotBiasFusion
+      ├── BiasAdd.input[0] == MusaTensorDot ✓
+      ├── BiasAdd.input[1] == 权重节点 ✓
+      └── 创建 MusaTensorDotBias(input_a, weight, bias, axes_a, axes_b)
 **归属判断规则**: 所有子图内部节点必须属于同一 Tensordot 前缀（`node_name == prefix` 或 `node_name.startswith(prefix + "/")`）。
 
 **融合后生成**: `MusaTensorDot` 算子，输入为原始数据（input_a）和权重（input_b），属性中携带 `axes_a` 和 `axes_b`。
